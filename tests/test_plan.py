@@ -62,5 +62,5 @@ class PlanTest(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 self.invoke(root, '--', 'cargo', 'test')
             self.assertFalse(root.exists())
-            result = self.invoke(root, '--allow-test-run', '--resource', directory, '--', 'cargo', 'test')
-            self.assertEqual(result['command_kind'], 'test-run')
+            result = self.invoke(root, '--resource', directory, '--', 'cargo', 'test', '--no-run')
+            self.assertEqual(result['command_kind'], 'test-compile')

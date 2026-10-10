@@ -82,11 +82,10 @@ def classify(command):
     return dict(kind=kind, executes_tests=False)
 
 
-def validate(command, allow_test_run=False):
+def validate(command):
     info = classify(command)
-    if info['executes_tests'] and not allow_test_run:
+    if info['executes_tests']:
         subcommand = 'bench' if info['kind'] == 'bench-run' else 'test'
-        raise ValueError(f'cargo {subcommand} executes tests/benchmarks. Compile only with cargo {subcommand} --no-run, '
-                         f'or explicitly allow execution: kyoto.py submit --allow-test-run -- cargo {subcommand} ... '
-                         '(put --allow-test-run before the -- separator).')
+        raise ValueError(f'cargo {subcommand} execution is not supported in Kyoto. '
+                         f'Compile with cargo {subcommand} --no-run, then run tests/benchmarks outside Kyoto.')
     return info

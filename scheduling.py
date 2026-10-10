@@ -10,7 +10,7 @@ import sys
 DEFAULT_CONFIG = {
     'mode': 'smart', 'max_running': 'auto', 'cpu_budget': os.cpu_count() or 1,
     'memory_budget_mb': 0, 'aging_seconds': 300,
-    'min_available_memory_mb': 0, 'pressure_aware': True,
+    'min_available_memory_mb': 0, 'pressure_aware': True, 'auto_defer': True,
 }
 
 
@@ -35,6 +35,9 @@ def choose_job(queued, running, config, now, available_mb=None):
     limit = config['max_running'] if config['max_running'] != 'auto' else 1
     if not queued or len(running) >= limit:
         return None, 'concurrency limit' if queued else 'queue empty'
+    queued = [j for j in queued if j.get('not_before', 0) <= now]
+    if not queued:
+        return None, 'waiting for deferred job cooldown'
     ordered = sorted(queued, key=lambda j: (j['submitted'], j['id']))
     aged = now - ordered[0]['submitted'] >= config['aging_seconds']
     if config['mode'] == 'fifo' or aged:
@@ -65,10 +68,11 @@ def forecast(queued, running, config, now):
             end = simulated + max(.1, job['estimate'])
             active.append(dict(job, end=end))
             results[job['id']] = (simulated - now, end - now)
-        elif active:
-            simulated = min(j['end'] for j in active)
         else:
-            break
+            events = [j['end'] for j in active] + [j['not_before'] for j in pending if j.get('not_before', 0) > simulated]
+            if not events:
+                break
+            simulated = min(events)
     return results
 
 

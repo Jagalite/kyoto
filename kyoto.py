@@ -14,13 +14,20 @@ import sys
 import time
 import uuid
 
-from commands import PRIORS, validate
+from commands import PRIORS
+from command_policy import initialize as initialize_policy, preset as policy_preset, read_policy, validate_policy, parameter as policy_parameter
+from progress import job_progress
+from deferral import DeferralController, COOLDOWN_SECONDS
 from pressure import AdaptiveController, SAMPLE_SECONDS, sample_host
 
 from scheduling import (DEFAULT_CONFIG, choose_job, discover_resources, forecast,
                         positive, sample_groups, execution_plan)
 
 JOB_COLUMNS = {
+    'allow_retry': 'INTEGER NOT NULL DEFAULT 0',
+    'deferral_count': 'INTEGER NOT NULL DEFAULT 0',
+    'deferring': 'INTEGER NOT NULL DEFAULT 0',
+    'not_before': 'REAL NOT NULL DEFAULT 0',
     'owner_id': 'TEXT',
     'command_kind': "TEXT NOT NULL DEFAULT 'opaque'",
     'build_state': "TEXT NOT NULL DEFAULT 'unknown'",
@@ -75,6 +82,11 @@ def connect(root, *, preview=False):
         sequence INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL,
         timestamp REAL NOT NULL, actor_id TEXT, owner_id TEXT, forced INTEGER NOT NULL,
         outcome TEXT NOT NULL)''')
+    db.execute('''CREATE TABLE IF NOT EXISTS deferred_attempts (
+        sequence INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL,
+        started REAL, requested REAL NOT NULL, finished REAL, exit_code INTEGER,
+        peak_rss_mb REAL, cpu_seconds REAL, reason TEXT NOT NULL)''')
+    initialize_policy(db)
     db.commit()
     return db
 
@@ -101,6 +113,7 @@ def public(row, root):
     item['command'] = json.loads(item['command'])
     item['log'] = str(root / (item['id'] + '.log'))
     item['elapsed_seconds'] = ((item['finished'] or time.time()) - item['started']) if item['started'] else None
+    item['progress'] = job_progress(root, item, time.time())
     item['estimate_source'] = 'recent successful runs' if item['samples'] else item['estimate_basis']
     return item
 
@@ -125,6 +138,57 @@ def finish(db, job_id, status, code=None, error=None, usage=None):
     db.commit()
 
 
+def group_alive(pgid):
+    try:
+        result = subprocess.run(['ps', '-axo', 'pgid=,stat='], capture_output=True, text=True, timeout=2, check=True)
+        return any(int(fields[0]) == pgid and not fields[1].startswith('Z')
+                   for line in result.stdout.splitlines() if len(fields := line.split()) == 2)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return True
+
+
+def begin_deferral(db, job_id, now):
+    db.execute('BEGIN IMMEDIATE')
+    try:
+        row = db.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone()
+        if row is None or row['cancel'] or row['status'] != 'running' or row['deferring']:
+            db.rollback()
+            return False
+        db.execute('UPDATE jobs SET deferring=1, deferral_count=deferral_count+1 WHERE id=?', (job_id,))
+        db.execute('INSERT INTO deferred_attempts(job_id,started,requested,reason) VALUES (?,?,?,?)',
+                   (job_id, row['started'], now, 'sustained memory/swap pressure'))
+        db.commit()
+        return True
+    except Exception:
+        db.rollback()
+        raise
+
+
+def complete_deferral(db, job_id, code, usage):
+    now = time.time()
+    db.execute('BEGIN IMMEDIATE')
+    try:
+        row = db.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone()
+        db.execute('UPDATE deferred_attempts SET finished=?,exit_code=?,peak_rss_mb=?,cpu_seconds=? WHERE job_id=? AND finished IS NULL',
+                   (now, code, row['peak_rss_mb'], usage.ru_utime + usage.ru_stime, job_id))
+        if row['cancel']:
+            db.execute("UPDATE jobs SET status='cancelled',finished=?,exit_code=?,deferring=0,current_rss_mb=0 WHERE id=?", (now, code, job_id))
+        elif code == 0:
+            db.execute('UPDATE jobs SET deferring=0 WHERE id=?', (job_id,))
+            finish(db, job_id, 'succeeded', code, usage=usage)
+        else:
+            db.execute("""UPDATE jobs SET status='queued',started=NULL,finished=NULL,exit_code=NULL,
+                deferring=0,not_before=?,current_rss_mb=0,peak_rss_mb=NULL,rss_samples=0,
+                cpu_seconds=NULL,user_cpu_seconds=NULL,system_cpu_seconds=NULL,wait_max_rss_mb=NULL,
+                io_input_blocks=NULL,io_output_blocks=NULL,error=NULL,
+                scheduling_reason='deferred for pressure; waiting for recovery' WHERE id=?""",
+                (now + COOLDOWN_SECONDS, job_id))
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+
 def worker(root):
     # Children inherit the coordinator lock. A replacement worker cannot overlap
     # surviving foreground commands after a coordinator crash.
@@ -134,23 +198,31 @@ def worker(root):
         except BlockingIOError:
             return
         db = connect(root)
-        db.execute("UPDATE jobs SET status='interrupted', finished=?, current_rss_mb=0, error='Worker stopped; command outcome unknown' WHERE status='running'", (time.time(),))
+        db.execute("UPDATE jobs SET status='interrupted', finished=?, current_rss_mb=0, deferring=0, error='Worker stopped; command outcome unknown' WHERE status='running'", (time.time(),))
+        db.execute("UPDATE deferred_attempts SET finished=?, reason=reason || '; worker stopped, outcome unknown' WHERE finished IS NULL", (time.time(),))
         db.commit()
         active = {}
         last_sample = 0
+        rss_fresh = False
         available_mb = None
         last_host_sample = 0
         last_config = None
         controller = AdaptiveController()
+        deferrer = DeferralController()
+        last_deferral = db.execute('SELECT MAX(requested) FROM deferred_attempts').fetchone()[0]
+        if last_deferral is not None:
+            deferrer.next_action = time.monotonic() + max(0, last_deferral + COOLDOWN_SECONDS - time.time())
         pressure_snapshot = {}
         policy = None
         while True:
             now = time.time()
+            host_sampled = False
             config = config_for(db)
             db.execute("UPDATE jobs SET status='cancelled', finished=? WHERE status='queued' AND cancel=1", (now,))
             db.commit()
             if now - last_sample >= .5:
                 sampled = sample_groups([state['process'].pid for state in active.values()]) if active else {}
+                rss_fresh = sampled is not None
                 if sampled is not None:
                     for job_id, state in active.items():
                         rss = sampled[state['process'].pid]
@@ -165,32 +237,58 @@ def worker(root):
                 policy, pressure_snapshot = controller.update(config, host, queued, running, time.monotonic())
                 pressure_snapshot['accounted_rss_mb'] = {j['id']: j['current_rss_mb'] for j in running}
                 pressure_snapshot['config'] = config
+                pressure_snapshot['worker_pid'] = os.getpid()
+                pressure_snapshot['supports_auto_defer'] = True
+                pressure_snapshot['supports_command_policy'] = True
                 db.execute('INSERT INTO runtime (id,value) VALUES (1,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value',
                            (json.dumps(pressure_snapshot),))
                 db.commit()
                 available_mb = host.get('available_mb')
                 last_host_sample = now
                 last_config = config
+                host_sampled = True
             for job_id, state in list(active.items()):
                 process = state['process']
                 # Reap directly with wait4: per-job usage cannot be isolated by
                 # subtracting global RUSAGE_CHILDREN when jobs overlap.
-                pid, wait_status, usage = os.wait4(process.pid, os.WNOHANG)
-                if pid:
-                    code = os.waitstatus_to_exitcode(wait_status)
-                    process.returncode = code
-                    if state['cancelled']:
-                        kill_group(process.pid, signal.SIGKILL)
-                    finish(db, job_id, 'cancelled' if state['cancelled'] else ('succeeded' if code == 0 else 'failed'), code, usage=usage)
-                    del active[job_id]
-                    continue
+                if 'reaped' in state:
+                    code, usage = state['reaped']
+                    pid = process.pid
+                else:
+                    pid, wait_status, usage = os.wait4(process.pid, os.WNOHANG)
+                    code = os.waitstatus_to_exitcode(wait_status) if pid else None
                 cancel = db.execute('SELECT cancel FROM jobs WHERE id=?', (job_id,)).fetchone()[0]
                 if cancel and not state['cancelled']:
                     state['cancelled'] = True
                     state['deadline'] = time.monotonic() + 3
                     kill_group(process.pid, signal.SIGTERM)
-                if state['cancelled'] and time.monotonic() >= state['deadline']:
+                if pid:
+                    process.returncode = code
+                    if state.get('deferring') or state['cancelled']:
+                        kill_group(process.pid, signal.SIGKILL)
+                        # Do not release the slot or requeue while descendants survive.
+                        if group_alive(process.pid):
+                            state['reaped'] = (code, usage)
+                            continue
+                    if state.get('deferring'):
+                        complete_deferral(db, job_id, code, usage)
+                    else:
+                        finish(db, job_id, 'cancelled' if state['cancelled'] else ('succeeded' if code == 0 else 'failed'), code, usage=usage)
+                    del active[job_id]
+                    continue
+                if (state['cancelled'] or state.get('deferring')) and time.monotonic() >= state['deadline']:
                     kill_group(process.pid, signal.SIGKILL)
+            if host_sampled and not any(s.get('deferring') for s in active.values()):
+                running = [job_dict(r) for r in db.execute("SELECT * FROM jobs WHERE status='running'")]
+                candidate = deferrer.choose(config, pressure_snapshot,
+                    [j for j in running if j['id'] in active and rss_fresh and time.time() - last_sample < 3], time.monotonic(), now)
+                if candidate and begin_deferral(db, candidate['id'], now):
+                    state = active[candidate['id']]
+                    state['deferring'] = True
+                    state['deadline'] = time.monotonic() + 3
+                    with open(root / (candidate['id'] + '.log'), 'ab') as log:
+                        log.write(b'\n[Kyoto: stopping for sustained memory/swap pressure; will retry]\n')
+                    kill_group(state['process'].pid, signal.SIGTERM)
             while not config['paused']:
                 queued = [job_dict(r) for r in db.execute("SELECT * FROM jobs WHERE status='queued' AND cancel=0")]
                 running = [job_dict(r) for r in db.execute("SELECT * FROM jobs WHERE status='running'")]
@@ -199,6 +297,15 @@ def worker(root):
                 row, reason = choose_job(queued, running, policy, time.time(), available_mb)
                 if row is None:
                     break
+                # Read policy and claim under one transaction, so admin updates
+                # cannot race the launch decision. A later update affects future starts.
+                db.execute('BEGIN IMMEDIATE')
+                try:
+                    validate_policy(json.loads(row['command']), db)
+                except ValueError as exc:
+                    db.execute("UPDATE jobs SET status='failed',finished=?,exit_code=2,error=? WHERE id=? AND status='queued' AND cancel=0", (time.time(), str(exc), row['id']))
+                    db.commit()
+                    continue
                 # Cancel can arrive after selection. Only claim uncancelled jobs.
                 cursor = db.execute("UPDATE jobs SET status='running', started=?, scheduling_reason=? WHERE id=? AND status='queued' AND cancel=0",
                                     (time.time(), reason, row['id']))
@@ -207,6 +314,8 @@ def worker(root):
                     continue
                 try:
                     with open(root / (row['id'] + '.log'), 'ab', buffering=0) as log:
+                        if row.get('deferral_count'):
+                            log.write(b'\n[Kyoto: retry starting]\n')
                         process = subprocess.Popen(json.loads(row['command']), cwd=row['cwd'],
                             env=json.loads(row['environment']), stdin=subprocess.DEVNULL,
                             stdout=log, stderr=log, start_new_session=True, pass_fds=(lock.fileno(),))
@@ -235,7 +344,7 @@ def submit_job(db, root, args, parser):
     if not command:
         parser.error('provide a command after --')
     try:
-        info = validate(command, args.allow_test_run)
+        info = validate_policy(command, db)
     except ValueError as exc:
         parser.error(str(exc))
     prior_time, prior_cpu, prior_memory = PRIORS[info['kind']]
@@ -260,9 +369,12 @@ def submit_job(db, root, args, parser):
     memory = args.memory_mb if args.memory_mb is not None else max(64, max(memories) * 1.25) if memories else prior_memory
     cpus = [max(1, math.ceil(r['cpu_seconds'] / max(.01, r['duration']))) for r in history if r['cpu_seconds'] is not None]
     cpu_slots = args.cpu_slots if args.cpu_slots is not None else max(cpus) if cpus else prior_cpu
+    if info['kind'] in ('build', 'check', 'clippy', 'test-compile', 'test-run', 'bench-compile', 'bench-run', 'doc'):
+        env.setdefault('CARGO_TERM_PROGRESS_WHEN', 'always')
+        env.setdefault('CARGO_TERM_PROGRESS_WIDTH', '80')
     preview = args.action == 'plan'
     owner = identity(args.user_id, parser)
-    values = dict(owner_id=owner if preview else owner or str(uuid.uuid4()), command_kind=info['kind'], build_state=args.build_state, allow_test_run=int(args.allow_test_run),
+    values = dict(owner_id=owner if preview else owner or str(uuid.uuid4()), command_kind=info['kind'], build_state=args.build_state, allow_test_run=int(info['executes_tests']), allow_retry=int(args.allow_retry),
                   estimate_basis='explicit hint' if args.estimate is not None else 'command-class prior',
                   id='preview' if preview else uuid.uuid4().hex, command=json.dumps(command), cwd=cwd,
                   environment=json.dumps(env), signature=signature, status='queued', submitted=time.time(),
@@ -282,7 +394,7 @@ def plan_submission(db, values):
     config = config_for(db)
     runtime = runtime_for(db)
     now = time.time()
-    fresh = bool(runtime and now - runtime['sampled_at'] < 10 and runtime.get('config') == config)
+    fresh = bool(runtime and now - runtime['sampled_at'] < 10 and dict(DEFAULT_CONFIG, **runtime.get('config', {})) == config)
     limit = runtime['effective_max_running'] if fresh else 0
     planning_limit = limit or (config['max_running'] if config['max_running'] != 'auto' else 1)
     rows = [job_dict(r) for r in db.execute("SELECT * FROM jobs WHERE status IN ('queued','running')")]
@@ -298,7 +410,7 @@ def plan_submission(db, values):
     elif not limit:
         reason = runtime['admission_reason']
     fields = ('planned_order', 'planned_wave', 'planned_start_in_seconds', 'planned_finish_in_seconds')
-    return dict(preview=True, enqueued=False, owner_id=values['owner_id'],
+    return dict(preview=True, enqueued=False, policy=validate_policy(json.loads(values['command']), db), owner_id=values['owner_id'],
                 command=json.loads(values['command']), cwd=values['cwd'],
                 command_kind=values['command_kind'], estimate=values['estimate'],
                 estimate_source='recent successful runs' if values['samples'] else values['estimate_basis'],
@@ -330,7 +442,7 @@ def status(db, root):
     running = [job_dict(r) for r in rows if r['status'] == 'running']
     now = time.time()
     runtime = runtime_for(db)
-    fresh = runtime and now - runtime['sampled_at'] < 10 and runtime.get('config') == config
+    fresh = runtime and now - runtime['sampled_at'] < 10 and dict(DEFAULT_CONFIG, **runtime.get('config', {})) == config
     policy = dict(config, max_running=runtime['effective_max_running'] if fresh else 0,
                   min_available_memory_mb=runtime['effective_memory_reserve_mb'] if fresh else 0)
     available = runtime.get('available_mb') if fresh else None
@@ -440,7 +552,7 @@ def main():
     submit.add_argument('--user-id', help='Agent UUID; defaults to KYOTO_USER_ID; submit generates one if absent')
     submit.add_argument('--cwd', default=os.getcwd())
     submit.add_argument('--estimate', type=positive_float, help='No-history duration hint in seconds; otherwise command-class prior')
-    submit.add_argument('--allow-test-run', action='store_true', help='Explicitly allow Cargo tests or benchmarks to execute')
+    submit.add_argument('--allow-retry', action='store_true', help='Allow pressure-triggered retries of arbitrary commands')
     submit.add_argument('--build-state', choices=['unknown', 'cold', 'incremental'], default='unknown', help='Caller-provided build state; keeps learned histories separate')
     submit.add_argument('--cpu-slots', type=positive_int, help='CPU cost hint for reporting; not an admission reservation')
     submit.add_argument('--memory-mb', type=positive_float, help='Memory cost hint in MiB for reporting; not an admission reservation')
@@ -448,10 +560,25 @@ def main():
     submit.add_argument('command', nargs=argparse.REMAINDER)
     commands.add_parser('submit', parents=[submission])
     commands.add_parser('plan', parents=[submission], help='Preview a submission in the shared queue without enqueueing or starting a worker')
+    policy_cli = commands.add_parser('policy', help='Shared admin Cargo command policy')
+    policy_actions = policy_cli.add_subparsers(dest='policy_action', required=True)
+    policy_actions.add_parser('show')
+    presets = policy_actions.add_parser('preset', help='Replace rules with a preset')
+    presets.add_argument('preset_name', choices=['compile-only', 'allow-all', 'deny-all'])
+    removal = policy_actions.add_parser('remove')
+    removal.add_argument('rule_id', type=positive_int)
+    for action in ('allow', 'deny', 'require', 'limit'):
+        rule = policy_actions.add_parser(action)
+        rule.add_argument('cargo_command', help='Cargo subcommand or quoted glob, e.g. "*"')
+        rule.add_argument('--param', required=action in ('require', 'limit'), help='Parameter name without leading dashes')
+        rule.add_argument('--value', help='Exact parameter value')
+        rule.add_argument('--scope', choices=['cargo', 'args'], default='cargo', help='Cargo options or arguments after --')
+        rule.add_argument('--max-value', type=positive_int, required=action == 'limit')
     configure = commands.add_parser('config', help='Show or update shared live scheduling policy')
     configure.add_argument('--mode', choices=['fifo', 'smart'])
     configure.add_argument('--max-running', type=concurrency_limit, help='Positive integer or auto')
     configure.add_argument('--pressure-aware', choices=['on', 'off'], help='Gate new starts on swap and host memory pressure')
+    configure.add_argument('--auto-defer', choices=['on', 'off'], help='Stop and requeue eligible builds under sustained severe pressure (default on)')
     configure.add_argument('--cpu-budget', type=positive_int)
     configure.add_argument('--memory-budget-mb', type=nonnegative_float, help='Deprecated compatibility option; no admission effect')
     configure.add_argument('--aging-seconds', type=positive_float)
@@ -474,7 +601,7 @@ def main():
     filters.add_argument('--mine', action='store_true', help='Filter by KYOTO_USER_ID')
     filters.add_argument('--user-id', help='Filter by owner UUID')
     jobs.add_argument('--limit', type=positive_int, default=50)
-    for name in ('show', 'wait', 'cancel', 'logs', 'audit'):
+    for name in ('show', 'wait', 'cancel', 'logs', 'audit', 'attempts'):
         p = commands.add_parser(name)
         p.add_argument('id')
         if name == 'cancel':
@@ -497,10 +624,46 @@ def main():
         db.close()
         worker(root)
         return 0
-    if args.action == 'config':
+    if args.action == 'policy':
+        if args.policy_action != 'show':
+            db.execute('BEGIN IMMEDIATE')
+        if args.policy_action == 'preset':
+            policy_preset(db, args.preset_name)
+        elif args.policy_action == 'remove':
+            if not db.execute('DELETE FROM command_policy_rules WHERE id=?', (args.rule_id,)).rowcount:
+                parser.error('unknown policy rule ID')
+        elif args.policy_action != 'show':
+            if args.value is not None and not args.param:
+                parser.error('--value requires --param')
+            if args.max_value is not None and args.policy_action != 'limit':
+                parser.error('--max-value is only supported by policy limit')
+            if args.policy_action == 'limit' and args.value is not None:
+                parser.error('policy limit uses --max-value, not --value')
+            try:
+                param = policy_parameter(args.param) if args.param else None
+            except ValueError as exc:
+                parser.error(str(exc))
+            from commands import ALIASES
+            db.execute('INSERT INTO command_policy_rules(action,command,scope,parameter,value,max_value) VALUES (?,?,?,?,?,?)',
+                       (args.policy_action, ALIASES.get(args.cargo_command, args.cargo_command), args.scope, param, args.value, args.max_value))
+        rejected = []
+        if args.policy_action != 'show':
+            for row in db.execute("SELECT id,command FROM jobs WHERE status='queued' AND cancel=0").fetchall():
+                try:
+                    validate_policy(json.loads(row['command']), db)
+                except ValueError as exc:
+                    db.execute("UPDATE jobs SET status='failed',finished=?,exit_code=2,error=? WHERE id=? AND status='queued'", (time.time(), str(exc), row['id']))
+                    rejected.append(row['id'])
+        db.commit()
+        result = read_policy(db)
+        if args.policy_action != 'show':
+            result['rejected_queued_jobs'] = rejected
+        print(json.dumps(result))
+    elif args.action == 'config':
         updates = {key: getattr(args, key) for key in DEFAULT_CONFIG if getattr(args, key) is not None}
-        if 'pressure_aware' in updates:
-            updates['pressure_aware'] = updates['pressure_aware'] == 'on'
+        for key in ('pressure_aware', 'auto_defer'):
+            if key in updates:
+                updates[key] = updates[key] == 'on'
         if args.pause or args.resume:
             updates['paused'] = args.pause
         for key, value in updates.items():
@@ -538,6 +701,9 @@ def main():
                 parser.error('cancellation denied: supply the matching --user-id / KYOTO_USER_ID, or explicitly use --force')
             ensure_worker(root)
             row = db.execute('SELECT * FROM jobs WHERE id=?', (args.id,)).fetchone()
+        elif args.action == 'attempts':
+            print(json.dumps([dict(r) for r in db.execute('SELECT * FROM deferred_attempts WHERE job_id=? ORDER BY sequence', (args.id,))]))
+            return 0
         elif args.action == 'audit':
             print(json.dumps([dict(r) for r in db.execute('SELECT * FROM cancellation_audit WHERE job_id=? ORDER BY sequence', (args.id,))]))
             return 0

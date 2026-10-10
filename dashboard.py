@@ -11,6 +11,7 @@ import time
 import unicodedata
 
 from commands import classify
+from progress import job_progress, progress_label
 from scheduling import DEFAULT_CONFIG, choose_job, execution_plan
 from target_sizes import TargetSizes
 
@@ -59,6 +60,8 @@ def read_snapshot(root, history=6):
                    'cpu_slots, memory_mb, current_rss_mb, peak_rss_mb, cpu_seconds, cancel, error, resources')
         existing = {r[1] for r in db.execute('PRAGMA table_info(jobs)')}
         columns += ', owner_id' if 'owner_id' in existing else ', NULL AS owner_id'
+        for name in ('deferral_count', 'deferring', 'not_before'):
+            columns += ', ' + name if name in existing else ', 0 AS ' + name
         active = [dict(r) for r in db.execute('SELECT ' + columns + " FROM jobs WHERE status IN ('queued','running') ORDER BY CASE status WHEN 'running' THEN 0 ELSE 1 END, submitted, id")]
         recent = [dict(r) for r in db.execute('SELECT ' + columns + " FROM jobs WHERE status NOT IN ('queued','running') ORDER BY finished DESC, id DESC LIMIT ?", (history + 1,))]
         snapshot['more_history'] = len(recent) > history
@@ -68,9 +71,10 @@ def read_snapshot(root, history=6):
         for job in snapshot['jobs']:
             job['command'] = json.loads(job['command'])
             job['resources'] = json.loads(job['resources'])
+            job['progress'] = job_progress(root, job, snapshot['now']) if job['status'] == 'running' else {}
         runtime = snapshot['runtime']
         config = snapshot['config']
-        fresh = bool(runtime and snapshot['now'] - runtime['sampled_at'] < 10 and runtime.get('config') == config)
+        fresh = bool(runtime and snapshot['now'] - runtime['sampled_at'] < 10 and dict(DEFAULT_CONFIG, **runtime.get('config', {})) == config)
         snapshot['fresh'] = fresh
         if config['paused']:
             snapshot['reason'] = 'Queue paused; running commands continue'
@@ -181,7 +185,10 @@ TABLE_HEADER = 'ID       STATE       ELAPSED     EST RSS/PEAK  MEM EST CPU      
 
 def plain(snapshot, root):
     lines = headers(snapshot) + ['', TABLE_HEADER]
-    lines.extend(job_line(job, snapshot['now']) for job in snapshot['jobs'])
+    for job in snapshot['jobs']:
+        lines.append(job_line(job, snapshot['now']))
+        if job['status'] == 'running':
+            lines.append('         ' + progress_label(job.get('progress', {})))
     if not snapshot['jobs']:
         lines.append('No jobs yet.')
     lines += ['', '* = unlearned duration hint; MEM EST/CPU are cost estimates, not measured use.',
@@ -320,6 +327,12 @@ def draw_dashboard(screen, snapshot, root, selected, logs, styles, error=None):
             project = short(Path(job['cwd']).name, list_width - 4)
             if job.get('planned_order'):
                 project = plan_label(job) + ' · ' + Path(job['cwd']).name
+            if job.get('deferring'):
+                project += ' · stopping to retry'
+            elif job['status'] == 'queued' and job.get('not_before', 0) > snapshot['now']:
+                project += ' · cooling down ' + duration(job['not_before'] - snapshot['now'])
+            elif job['status'] == 'running':
+                project += ' · ' + progress_label(job.get('progress', {}))
             mark = '›' if focused else ' '
             state_style = 'good' if job['status'] in ('running', 'succeeded') else 'warn' if job['status'] in ('queued', 'cancelled', 'interrupted') else 'bad'
             if job['cancel'] and job['status'] in ('queued', 'running'):
@@ -329,7 +342,7 @@ def draw_dashboard(screen, snapshot, root, selected, logs, styles, error=None):
             put(row, 2, mark, 'accent')
             put(row, 4, project, state_style, list_width - 2, bold=focused)
         else:
-            put(row, 4, short(shlex.join(value['command']), list_width - 3), 'text', list_width - 2, bold=focused)
+            put(row, 4, short(shlex.join(value['command']), list_width - 3), 'muted', list_width - 2, bold=focused)
     if not jobs:
         put(8, 3, 'Nothing in the queue.', 'muted')
         put(10, 3, 'Submit a build from another terminal.', 'muted', list_width)

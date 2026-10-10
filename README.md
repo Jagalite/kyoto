@@ -51,13 +51,24 @@ In the dashboard, use arrows or `j`/`k` to select jobs, Page Up/Down to scroll,
 and Enter to view logs. Older history loads as you scroll. Press `q` to exit;
 builds continue running.
 
+Running jobs show compilation or current test-suite progress, including a
+percentage when Cargo/libtest reports a total. Percentages count build units or
+tests, not elapsed time. Remaining time uses previous successful runs of the
+same command; absent history or an exceeded estimate shows `ETA unknown`.
+New submissions enable Cargo's progress output unless the caller already set
+`CARGO_TERM_PROGRESS_WHEN`. Explicit quiet/JSON output or custom test runners
+may omit counters. Progress is parsed from the latest 1 MiB of each log; missing
+suite headers or totals show no percentage. `status` and `show` expose the same
+information in their `progress` field.
+
 ## Tests and scheduling
 
-Cargo test execution requires an explicit opt-in:
+By default Kyoto schedules test compilation only. Run tests and benchmarks
+outside Kyoto, or explicitly change the shared admin policy:
 
 ```sh
 kyoto.py submit -- cargo test --no-run                  # Compile tests
-kyoto.py submit --allow-test-run -- cargo test          # Compile and run tests
+cargo test                                            # Run directly after compilation
 kyoto.py config --mode fifo --max-running 2             # FIFO, two concurrent jobs
 kyoto.py config --mode smart --max-running auto         # Restore defaults
 ```
@@ -69,6 +80,78 @@ Use `kyoto.py --help` or `kyoto.py SUBCOMMAND --help` for options.
 Queue state and logs default to `~/.local/state/kyoto`. All participating agents
 should use the same state directory. The database stores full job environments;
 keep it and job logs private and out of Git.
+
+The test restriction recognizes Cargo commands and common wrappers; it does not
+inspect arbitrary shell scripts or custom aliases. Do not submit test execution
+through those wrappers.
+
+## Shared command policy
+
+```sh
+kyoto.py policy show
+kyoto.py policy allow test                         # Admin enables test execution
+kyoto.py policy deny clean
+kyoto.py policy deny build --param profile --value release
+kyoto.py policy require build --param locked
+kyoto.py policy limit '*' --param jobs --max-value 4
+kyoto.py policy deny test --scope args --param nocapture
+kyoto.py policy remove RULE_ID
+kyoto.py policy preset compile-only                # Replace rules with defaults
+```
+
+Rules are persistent and shared across projects. The **last matching rule wins**.
+`allow`/`deny` match a command, an optional parameter, and an optional exact
+value. `require` denies a command missing the parameter/value; `limit` denies
+present values that are not positive integers within the maximum. Parameter
+names omit leading dashes. Quoted command globs such as `'*'` are supported.
+Rules inspect supplied arguments, not values inherited from Cargo configuration
+or environment variables. Rules normalize Cargo aliases, short flags and `--name=value`; `--release` also
+matches `profile=release`. Repeated values are all checked. `--scope cargo` is
+the default; `--scope args` examines arguments following Cargo's `--` separator.
+Cargo help/version requests are exempt from `require` rules.
+
+The initial preset allows commands but requires `--no-run` for test/bench.
+`policy allow test` overrides that requirement; benchmark permission is separate.
+For a command allowlist, use `policy preset deny-all`, then add `allow` rules.
+`policy preset allow-all` removes all restrictions. Presets replace existing rules.
+An allow rule for one parameter value does not deny other values by itself;
+use a deny rule first, a `require` rule, or the deny-all preset as appropriate.
+
+Planning and submission check the policy. Policy edits immediately reject queued
+jobs that no longer qualify, and workers recheck before launch. Rejected jobs
+finish with an error explaining the rule; running jobs continue. Enabling tests
+does not grant automatic retry permission. These are local operator controls,
+not authenticated admin accounts. Rules inspect recognizable Cargo invocations,
+not arbitrary shell scripts or code inside build scripts/custom aliases.
+
+## Automatic deferral
+
+Kyoto can stop and requeue builds when critical memory pressure or heavy swap
+traffic persists for 20 seconds (swap writes at least 1 MiB/s or reads at least
+4 MiB/s). Warning pressure or occupied swap alone does not trigger a kill.
+It selects one job with at least 128 MiB measured RSS, favoring memory relief
+and less elapsed work, sends TERM then KILL if needed, and waits for its process
+group to exit before releasing the slot. It waits 60 seconds before another
+deferral, and the job waits at least 60 seconds plus pressure recovery before
+retrying. Each job can be deferred at most twice; jobs at the cap continue
+running. This is enabled by default alongside pressure monitoring.
+
+Build, check, clippy and compile-only test/benchmark commands are eligible.
+Other commands require explicit retry permission. Test/benchmark
+execution requires a policy change and is excluded from automatic deferral:
+
+```sh
+kyoto.py submit --allow-retry -- ./repeatable-build.sh
+kyoto.py config --auto-defer off
+kyoto.py attempts JOB_ID
+```
+
+Retries retain the same job ID and owner, and `wait` keeps waiting. Logs are
+appended with retry markers. Deferred attempts retain timing and resource
+records but do not enter successful duration history; the eventual successful
+attempt is measured separately. User cancellation overrides requeueing.
+Completed Cargo artifacts remain reusable. Build scripts can rerun, so disable
+auto-deferral if a build performs work that must not be repeated.
 
 ## Development
 

@@ -3,15 +3,14 @@ from commands import PRIORS, classify, validate
 
 
 class CommandPolicyTest(unittest.TestCase):
-    def test_test_run_requires_opt_in(self):
+    def test_test_run_is_rejected(self):
         for command in (['cargo', 'test'], ['cargo', 't'], ['/bin/cargo', '+stable', '-q', 'test'],
                         ['cargo', '--config', 'build.jobs=2', 'test'],
                         ['rustup', 'run', 'stable', 'cargo', 'test'],
                         ['env', 'RUST_LOG=info', 'cargo', 'test']):
             with self.subTest(command=command):
-                with self.assertRaisesRegex(ValueError, '--allow-test-run'):
+                with self.assertRaisesRegex(ValueError, '--no-run'):
                     validate(command)
-                self.assertEqual(validate(command, True)['kind'], 'test-run')
 
     def test_compile_only_and_help_are_allowed(self):
         self.assertEqual(validate(['cargo', 'test', '--no-run'])['kind'], 'test-compile')
@@ -24,10 +23,9 @@ class CommandPolicyTest(unittest.TestCase):
             with self.subTest(flags=flags), self.assertRaises(ValueError):
                 validate(['cargo', 'test'] + flags)
 
-    def test_bench_execution_requires_same_opt_in(self):
+    def test_bench_execution_is_rejected(self):
         with self.assertRaises(ValueError):
             validate(['cargo', 'bench'])
-        self.assertEqual(validate(['cargo', 'bench'], True)['kind'], 'bench-run')
 
     def test_command_classes_have_different_starting_costs(self):
         for command, kind in [('build', 'build'), ('check', 'check'), ('clippy', 'clippy'),

@@ -192,9 +192,7 @@ class QueueTest(unittest.TestCase):
         compilation = json.loads(self.cli('submit', '--cwd', str(projects[0]), '--', 'cargo', 'test', '--offline', '--frozen', '--target-dir', str(target), '--no-run').stdout)
         self.assertEqual(self.wait(compilation['id'])['status'], 'succeeded')
         self.assertNotIn('running 1 test', self.cli('logs', compilation['id']).stdout)
-        execution = json.loads(self.cli('submit', '--allow-test-run', '--cwd', str(projects[0]), '--', 'cargo', 'test', '--offline', '--frozen', '--target-dir', str(target)).stdout)
-        self.assertEqual(self.wait(execution['id'])['status'], 'succeeded')
-        self.assertIn('running 1 test', self.cli('logs', execution['id']).stdout)
+
 
 
     def test_auto_worker_scales_and_defers_new_starts_under_pressure(self):
@@ -245,20 +243,18 @@ kyoto.worker(Path(sys.argv[1]))
         host_pressure('normal')
         self.assertEqual(self.wait(third)['status'], 'succeeded')
 
-    def test_test_policy_rejects_before_enqueue_and_persists_override(self):
+    def test_test_policy_rejects_execution_and_removed_override(self):
         self.cli('config', '--pause')
         denied = self.cli('submit', '--', 'cargo', 'test', check=False)
         self.assertNotEqual(denied.returncode, 0)
-        self.assertIn('--allow-test-run', denied.stderr)
+        self.assertIn('--no-run', denied.stderr)
         self.assertEqual(json.loads(self.cli('status').stdout), [])
         compiled = json.loads(self.cli('submit', '--resource', self.temp.name, '--', 'cargo', 'test', '--no-run').stdout)
-        forced = json.loads(self.cli('submit', '--allow-test-run', '--resource', self.temp.name, '--', 'cargo', 'test').stdout)
+        forced = self.cli('submit', '--allow-test-run', '--', 'cargo', 'test', check=False)
+        self.assertNotEqual(forced.returncode, 0)
         checked = json.loads(self.cli('submit', '--resource', self.temp.name, '--', 'cargo', 'check').stdout)
         self.assertEqual(compiled['command_kind'], 'test-compile')
         self.assertEqual(compiled['allow_test_run'], 0)
-        self.assertEqual(forced['command_kind'], 'test-run')
-        self.assertEqual(forced['allow_test_run'], 1)
-        self.assertEqual(forced['command'], ['cargo', 'test'])
         self.assertEqual(checked['estimate'], 45)
         self.assertEqual(checked['memory_mb'], 768)
         self.assertEqual(checked['estimate_source'], 'command-class prior')
