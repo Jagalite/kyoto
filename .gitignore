@@ -1,0 +1,24 @@
+# Python generated files and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# macOS metadata
+.DS_Store
+
+# Local secrets
+.env
+.env.*
+!.env.example
+
+# Kyoto runtime state and logs (may contain environments and personal paths)
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+*.log
+worker.lock
