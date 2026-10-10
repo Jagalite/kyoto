@@ -144,24 +144,129 @@ class QueueTest(unittest.TestCase):
         self.cli('config', '--resume')
         self.assertTrue(all(self.wait(job)['status'] == 'succeeded' for job in ids))
 
-    def test_worker_crash_holds_lock_until_command_exits(self):
-        self.cli('config', '--pause', '--max-running', '1')
-        first = self.submit('import time; time.sleep(3)')
-        second = self.submit('print("next")')
+    def test_worker_restart_recovers_running_job_and_exit_status(self):
+        self.cli('config', '--pause', '--max-running', '2')
+        marker = Path(self.temp.name) / 'executions'
+        code = f"from pathlib import Path; import time; p=Path({str(marker)!r}); p.open('a').write('once\\n'); time.sleep(3); raise SystemExit(7)"
+        first = self.submit(code)
         self.cli('config', '--resume')
-        deadline = time.monotonic() + 5
-        while json.loads(self.cli('show', first).stdout)['status'] != 'running':
+        deadline = time.monotonic() + 15
+        while not marker.exists():
             self.assertLess(time.monotonic(), deadline)
             time.sleep(.05)
         self.worker.kill()
         self.worker.wait(timeout=5)
-        replacement = subprocess.Popen(self.base + ['_worker'])
-        self.assertEqual(replacement.wait(timeout=5), 0)
-        self.assertEqual(json.loads(self.cli('show', second).stdout)['status'], 'queued')
-        time.sleep(3.2)
         self.worker = subprocess.Popen(self.base + ['_worker'], start_new_session=True)
+        second = self.submit('print("next")')
+        b = self.wait(second)
+        a = self.wait(first)
+        self.assertEqual(b['status'], 'succeeded')
+        self.assertLess(b['finished'], a['finished'])
+        self.assertEqual(a['status'], 'failed')
+        self.assertEqual(a['exit_code'], 7)
+        self.assertEqual(marker.read_text(), 'once\n')
+        self.assertGreater(a['cpu_seconds'], 0)
+
+    def test_recovered_job_still_holds_slot_and_can_be_cancelled(self):
+        self.cli('config', '--max-running', '1')
+        marker = Path(self.temp.name) / 'ready'
+        first = self.submit(f"from pathlib import Path; import time; Path({str(marker)!r}).touch(); time.sleep(20)")
+        deadline = time.monotonic() + 15
+        while not marker.exists():
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(.05)
+        self.worker.kill()
+        self.worker.wait(timeout=5)
+        self.worker = subprocess.Popen(self.base + ['_worker'], start_new_session=True)
+        second = self.submit('print("next")')
+        time.sleep(.3)
+        self.assertEqual(json.loads(self.cli('show', second).stdout)['status'], 'queued')
+        self.cli('cancel', first)
+        self.assertEqual(self.wait(first)['status'], 'cancelled')
         self.assertEqual(self.wait(second)['status'], 'succeeded')
+
+    def test_result_survives_completion_while_worker_is_stopped(self):
+        marker = Path(self.temp.name) / 'ready'
+        job = self.submit(f"from pathlib import Path; import time; Path({str(marker)!r}).touch(); time.sleep(.5)")
+        deadline = time.monotonic() + 15
+        while not marker.exists():
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(.05)
+        self.worker.kill()
+        self.worker.wait(timeout=5)
+        row = json.loads(self.cli('show', job).stdout)
+        receipt = Path(self.temp.name) / 'attempts' / row['attempt_token'] / 'result.json'
+        # Give completion its own deadline: process inspection can be delayed
+        # on a host concurrently running memory-intensive Cargo builds.
+        deadline = time.monotonic() + 15
+        while not receipt.exists():
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(.05)
+        self.worker = subprocess.Popen(self.base + ['_worker'], start_new_session=True)
+        self.assertEqual(self.wait(job)['status'], 'succeeded')
+        duplicate = subprocess.Popen(self.base + ['_worker'])
+        self.assertEqual(duplicate.wait(timeout=5), 0)
+        self.assertIsNone(self.worker.poll())
+
+    def test_legacy_build_does_not_block_recovery(self):
+        import fcntl
+        self.cli('config', '--pause', '--max-running', '2')
+        job = self.submit('import time; time.sleep(20)')
+        self.worker.terminate()
+        self.worker.wait(timeout=5)
+        root = Path(self.temp.name)
+        with (root / 'worker.lock').open('a') as lock, (root / (job + '.log')).open('ab') as log:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            legacy = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(20)'],
+                                      stdout=log, stderr=log, start_new_session=True, pass_fds=(lock.fileno(),))
+        try:
+            with sqlite3.connect(root / 'queue.sqlite') as db:
+                db.execute("UPDATE jobs SET status='running',started=? WHERE id=?", (time.time(), job))
+            self.worker = subprocess.Popen(self.base + ['_worker'], start_new_session=True)
+            self.cli('config', '--resume')
+            second = self.submit('print("recovered")')
+            self.assertEqual(self.wait(second)['status'], 'succeeded')
+            self.assertIsNone(legacy.poll())
+            self.assertEqual(json.loads(self.cli('show', job).stdout)['status'], 'running')
+            legacy.terminate()
+            legacy.wait(timeout=5)
+            old = self.wait(job)
+            self.assertEqual(old['status'], 'interrupted')
+            self.assertIsNone(old['exit_code'])
+        finally:
+            if legacy.poll() is None:
+                legacy.kill()
+                legacy.wait(timeout=5)
+
+    def test_lost_runner_with_closed_fds_preserves_running_slot(self):
+        import signal
+        self.cli('config', '--max-running', '1')
+        root = Path(self.temp.name)
+        release = root / 'release'
+        code = ("import os,time; from pathlib import Path; os.closerange(3,256); "
+                f"p=Path({str(release)!r})\nwhile not p.exists(): time.sleep(.05)")
+        first = self.submit(code)
+        deadline = time.monotonic() + 15
+        while True:
+            row = json.loads(self.cli('show', first).stdout)
+            token = row.get('attempt_token')
+            record = root / 'attempts' / (token or 'pending') / 'process.json'
+            if record.exists():
+                break
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(.05)
+        pid = json.loads(record.read_text())['pid']
+        runner = int(subprocess.check_output(['ps', '-p', str(pid), '-o', 'ppid='], text=True).strip())
+        try:
+            os.kill(runner, signal.SIGKILL)
+            second = self.submit('print("next")')
+            time.sleep(.4)
+            self.assertEqual(json.loads(self.cli('show', first).stdout)['status'], 'running')
+            self.assertEqual(json.loads(self.cli('show', second).stdout)['status'], 'queued')
+        finally:
+            release.touch()
         self.assertEqual(self.wait(first)['status'], 'interrupted')
+        self.assertEqual(self.wait(second)['status'], 'succeeded')
 
     @unittest.skipUnless(os.environ.get('KYOTO_TEST_CARGO') == '1' and shutil.which('cargo'), 'set KYOTO_TEST_CARGO=1 for real Cargo smoke')
     def test_real_cargo_incremental_and_shared_target(self):

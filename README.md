@@ -153,6 +153,20 @@ attempt is measured separately. User cancellation overrides requeueing.
 Completed Cargo artifacts remain reusable. Build scripts can rerun, so disable
 auto-deferral if a build performs work that must not be repeated.
 
+## Worker recovery
+
+`kyoto.py start` restarts a missing scheduler; `wait` also checks for one
+periodically. Each new job runs under an independent runner that saves its
+process identity and exit result in the state directory. Restarting the scheduler
+preserves running jobs, their slots, explicit resource locks, and cancellation.
+Build processes do not hold the scheduler lock.
+
+Jobs started by older Kyoto versions can be monitored without stopping them.
+If their original worker exited, their final exit code is unavailable: Kyoto
+marks them `interrupted` once they stop, rather than assuming success or rerunning
+them. The same applies if a new job loses its runner and no exit result survives.
+Do not delete lock files to recover the scheduler.
+
 ## Development
 
 ```sh

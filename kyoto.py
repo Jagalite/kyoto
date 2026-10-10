@@ -13,6 +13,9 @@ import subprocess
 import sys
 import time
 import uuid
+from types import SimpleNamespace
+
+import recovery
 
 from commands import PRIORS
 from command_policy import initialize as initialize_policy, preset as policy_preset, read_policy, validate_policy, parameter as policy_parameter
@@ -24,6 +27,7 @@ from scheduling import (DEFAULT_CONFIG, choose_job, discover_resources, forecast
                         positive, sample_groups, execution_plan)
 
 JOB_COLUMNS = {
+    'attempt_token': 'TEXT',
     'allow_retry': 'INTEGER NOT NULL DEFAULT 0',
     'deferral_count': 'INTEGER NOT NULL DEFAULT 0',
     'deferring': 'INTEGER NOT NULL DEFAULT 0',
@@ -125,8 +129,8 @@ def kill_group(pid, sig):
         pass
 
 
-def finish(db, job_id, status, code=None, error=None, usage=None):
-    values = {'status': status, 'finished': time.time(), 'exit_code': code,
+def finish(db, job_id, status, code=None, error=None, usage=None, finished_at=None):
+    values = {'status': status, 'finished': finished_at if finished_at is not None else time.time(), 'exit_code': code,
               'error': error, 'current_rss_mb': 0}
     if usage is not None:
         values.update(cpu_seconds=usage.ru_utime + usage.ru_stime,
@@ -164,7 +168,7 @@ def begin_deferral(db, job_id, now):
         raise
 
 
-def complete_deferral(db, job_id, code, usage):
+def complete_deferral(db, job_id, code, usage, finished_at=None):
     now = time.time()
     db.execute('BEGIN IMMEDIATE')
     try:
@@ -175,7 +179,7 @@ def complete_deferral(db, job_id, code, usage):
             db.execute("UPDATE jobs SET status='cancelled',finished=?,exit_code=?,deferring=0,current_rss_mb=0 WHERE id=?", (now, code, job_id))
         elif code == 0:
             db.execute('UPDATE jobs SET deferring=0 WHERE id=?', (job_id,))
-            finish(db, job_id, 'succeeded', code, usage=usage)
+            finish(db, job_id, 'succeeded', code, usage=usage, finished_at=finished_at)
         else:
             db.execute("""UPDATE jobs SET status='queued',started=NULL,finished=NULL,exit_code=NULL,
                 deferring=0,not_before=?,current_rss_mb=0,peak_rss_mb=NULL,rss_samples=0,
@@ -190,18 +194,30 @@ def complete_deferral(db, job_id, code, usage):
 
 
 def worker(root):
-    # Children inherit the coordinator lock. A replacement worker cannot overlap
-    # surviving foreground commands after a coordinator crash.
-    with open(root / 'worker.lock', 'a') as lock:
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # Only the coordinator holds this lock; runners own separate attempt locks.
+    with open(root / 'coordinator.lock', 'a') as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return
+        legacy_lock = recovery.inspect_until_available(lambda: recovery.guard_legacy(root))
         db = connect(root)
-        db.execute("UPDATE jobs SET status='interrupted', finished=?, current_rss_mb=0, deferring=0, error='Worker stopped; command outcome unknown' WHERE status='running'", (time.time(),))
-        db.execute("UPDATE deferred_attempts SET finished=?, reason=reason || '; worker stopped, outcome unknown' WHERE finished IS NULL", (time.time(),))
-        db.commit()
         active = {}
+        for row in db.execute("SELECT * FROM jobs WHERE status='running'").fetchall():
+            process = (recovery.Attempt(root, row['attempt_token']) if row['attempt_token']
+                       else recovery.inspect_until_available(lambda: recovery.legacy_attempt(root, row['id'])))
+            if process is None:
+                finish(db, row['id'], 'interrupted', error='Previous worker stopped; command exit status unavailable')
+                db.execute("UPDATE deferred_attempts SET finished=?, reason=reason || '; command outcome unknown' WHERE job_id=? AND finished IS NULL", (time.time(), row['id']))
+                db.commit()
+            else:
+                active[row['id']] = dict(process=process, cancelled=False, deadline=None,
+                                         deferring=bool(row['deferring']))
+                if row['deferring']:
+                    active[row['id']]['deadline'] = time.monotonic() + 3
+
+        last_legacy_check = 0
         last_sample = 0
         rss_fresh = False
         available_mb = None
@@ -217,15 +233,18 @@ def worker(root):
         while True:
             now = time.time()
             host_sampled = False
+            if legacy_lock is None and now - last_legacy_check >= 2:
+                legacy_lock = recovery.claim_legacy_lock(root)
+                last_legacy_check = now
             config = config_for(db)
             db.execute("UPDATE jobs SET status='cancelled', finished=? WHERE status='queued' AND cancel=1", (now,))
             db.commit()
             if now - last_sample >= .5:
-                sampled = sample_groups([state['process'].pid for state in active.values()]) if active else {}
+                sampled = sample_groups([state['process'].pid for state in active.values() if state['process'].pid]) if active else {}
                 rss_fresh = sampled is not None
                 if sampled is not None:
                     for job_id, state in active.items():
-                        rss = sampled[state['process'].pid]
+                        rss = sampled.get(state['process'].pid, 0)
                         db.execute('UPDATE jobs SET current_rss_mb=?, peak_rss_mb=MAX(COALESCE(peak_rss_mb,0),?), rss_samples=rss_samples+1 WHERE id=?',
                                    (rss, rss, job_id))
                     db.commit()
@@ -240,6 +259,7 @@ def worker(root):
                 pressure_snapshot['worker_pid'] = os.getpid()
                 pressure_snapshot['supports_auto_defer'] = True
                 pressure_snapshot['supports_command_policy'] = True
+                pressure_snapshot['supports_recovery'] = True
                 db.execute('INSERT INTO runtime (id,value) VALUES (1,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value',
                            (json.dumps(pressure_snapshot),))
                 db.commit()
@@ -249,46 +269,39 @@ def worker(root):
                 host_sampled = True
             for job_id, state in list(active.items()):
                 process = state['process']
-                # Reap directly with wait4: per-job usage cannot be isolated by
-                # subtracting global RUSAGE_CHILDREN when jobs overlap.
-                if 'reaped' in state:
-                    code, usage = state['reaped']
-                    pid = process.pid
-                else:
-                    pid, wait_status, usage = os.wait4(process.pid, os.WNOHANG)
-                    code = os.waitstatus_to_exitcode(wait_status) if pid else None
+                result = process.poll_result()
                 cancel = db.execute('SELECT cancel FROM jobs WHERE id=?', (job_id,)).fetchone()[0]
                 if cancel and not state['cancelled']:
                     state['cancelled'] = True
                     state['deadline'] = time.monotonic() + 3
-                    kill_group(process.pid, signal.SIGTERM)
-                if pid:
-                    process.returncode = code
-                    if state.get('deferring') or state['cancelled']:
-                        kill_group(process.pid, signal.SIGKILL)
-                        # Do not release the slot or requeue while descendants survive.
-                        if group_alive(process.pid):
-                            state['reaped'] = (code, usage)
-                            continue
-                    if state.get('deferring'):
-                        complete_deferral(db, job_id, code, usage)
+                if result is not None:
+                    code = result['code']
+                    usage = SimpleNamespace(**result['usage']) if result['usage'] else None
+                    if state.get('deferring') and usage is not None:
+                        complete_deferral(db, job_id, code, usage, finished_at=result.get('finished'))
                     else:
-                        finish(db, job_id, 'cancelled' if state['cancelled'] else ('succeeded' if code == 0 else 'failed'), code, usage=usage)
+                        status = ('cancelled' if state['cancelled'] else 'succeeded' if code == 0
+                                  else 'interrupted' if result.get('interrupted') else 'failed')
+                        finish(db, job_id, status, code, error=result['error'], usage=usage, finished_at=result.get('finished'))
+                        db.execute('UPDATE jobs SET deferring=0 WHERE id=?', (job_id,))
+                        db.execute("UPDATE deferred_attempts SET finished=?, reason=reason || '; command outcome unknown' WHERE job_id=? AND finished IS NULL", (time.time(), job_id))
+                        db.commit()
                     del active[job_id]
                     continue
-                if (state['cancelled'] or state.get('deferring')) and time.monotonic() >= state['deadline']:
-                    kill_group(process.pid, signal.SIGKILL)
+                if state['cancelled'] or state.get('deferring'):
+                    process.signal(signal.SIGKILL if time.monotonic() >= state['deadline'] else signal.SIGTERM)
             if host_sampled and not any(s.get('deferring') for s in active.values()):
                 running = [job_dict(r) for r in db.execute("SELECT * FROM jobs WHERE status='running'")]
                 candidate = deferrer.choose(config, pressure_snapshot,
-                    [j for j in running if j['id'] in active and rss_fresh and time.time() - last_sample < 3], time.monotonic(), now)
+                    [j for j in running if j['id'] in active and isinstance(active[j['id']]['process'], recovery.Attempt)
+                     and active[j['id']]['process'].pid and rss_fresh and time.time() - last_sample < 3], time.monotonic(), now)
                 if candidate and begin_deferral(db, candidate['id'], now):
                     state = active[candidate['id']]
                     state['deferring'] = True
                     state['deadline'] = time.monotonic() + 3
                     with open(root / (candidate['id'] + '.log'), 'ab') as log:
                         log.write(b'\n[Kyoto: stopping for sustained memory/swap pressure; will retry]\n')
-                    kill_group(state['process'].pid, signal.SIGTERM)
+                    state['process'].signal(signal.SIGTERM)
             while not config['paused']:
                 queued = [job_dict(r) for r in db.execute("SELECT * FROM jobs WHERE status='queued' AND cancel=0")]
                 running = [job_dict(r) for r in db.execute("SELECT * FROM jobs WHERE status='running'")]
@@ -306,30 +319,32 @@ def worker(root):
                     db.execute("UPDATE jobs SET status='failed',finished=?,exit_code=2,error=? WHERE id=? AND status='queued' AND cancel=0", (time.time(), str(exc), row['id']))
                     db.commit()
                     continue
-                # Cancel can arrive after selection. Only claim uncancelled jobs.
-                cursor = db.execute("UPDATE jobs SET status='running', started=?, scheduling_reason=? WHERE id=? AND status='queued' AND cancel=0",
-                                    (time.time(), reason, row['id']))
-                db.commit()
-                if not cursor.rowcount:
-                    continue
-                try:
-                    with open(root / (row['id'] + '.log'), 'ab', buffering=0) as log:
+                # Persist the attempt before launch. Holding its lock bridges
+                # startup, so recovery can distinguish a live runner from a lost launch.
+                token = uuid.uuid4().hex
+                attempt_path = root / 'attempts' / token
+                attempt_path.mkdir(parents=True, mode=0o700)
+                with (attempt_path / 'lock').open('a') as attempt_lock:
+                    fcntl.flock(attempt_lock, fcntl.LOCK_EX)
+                    cursor = db.execute("UPDATE jobs SET status='running', started=?, scheduling_reason=?, attempt_token=? WHERE id=? AND status='queued' AND cancel=0",
+                                        (time.time(), reason, token, row['id']))
+                    db.commit()
+                    if not cursor.rowcount:
+                        continue
+                    try:
                         if row.get('deferral_count'):
-                            log.write(b'\n[Kyoto: retry starting]\n')
-                        process = subprocess.Popen(json.loads(row['command']), cwd=row['cwd'],
-                            env=json.loads(row['environment']), stdin=subprocess.DEVNULL,
-                            stdout=log, stderr=log, start_new_session=True, pass_fds=(lock.fileno(),))
-                    active[row['id']] = {'process': process, 'cancelled': False, 'deadline': None}
-                except (OSError, ValueError) as exc:
-                    finish(db, row['id'], 'failed', error=str(exc))
+                            with open(root / (row['id'] + '.log'), 'ab') as log:
+                                log.write(b'\n[Kyoto: retry starting]\n')
+                        process = recovery.launch(root, row['id'], token, attempt_lock)
+                        active[row['id']] = {'process': process, 'cancelled': False, 'deadline': None}
+                    except (OSError, ValueError) as exc:
+                        finish(db, row['id'], 'failed', error=str(exc))
             time.sleep(.1)
 
 
 def ensure_worker(root):
-    # Avoid spawning throwaway processes while a worker (or inherited command)
-    # already holds the lock. In particular, late starters must not outlive a
-    # caller that has deliberately stopped its test worker.
-    with open(root / 'worker.lock', 'a') as lock:
+    # Build processes never inherit the coordinator lock.
+    with open(root / 'coordinator.lock', 'a') as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
