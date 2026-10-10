@@ -83,7 +83,7 @@ class DashboardTest(unittest.TestCase):
             complete = read_snapshot(root)
             self.assertEqual(len(complete['jobs']), 35)
             self.assertFalse(complete['more_history'])
-            with patch('dashboard.TargetSizes') as sizes, contextlib.redirect_stdout(io.StringIO()) as output:
+            with patch('kyoto.recover_existing', return_value=True), patch('dashboard.TargetSizes') as sizes, contextlib.redirect_stdout(io.StringIO()) as output:
                 self.assertEqual(watch(root, once=True), 0)
                 sizes.return_value.update.assert_called_once_with([])
                 self.assertEqual(output.getvalue().count('succeeded'), 35)

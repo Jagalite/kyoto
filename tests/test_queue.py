@@ -192,9 +192,9 @@ class QueueTest(unittest.TestCase):
         while not marker.exists():
             self.assertLess(time.monotonic(), deadline)
             time.sleep(.05)
+        row = json.loads(self.cli('show', job).stdout)
         self.worker.kill()
         self.worker.wait(timeout=5)
-        row = json.loads(self.cli('show', job).stdout)
         receipt = Path(self.temp.name) / 'attempts' / row['attempt_token'] / 'result.json'
         # Give completion its own deadline: process inspection can be delayed
         # on a host concurrently running memory-intensive Cargo builds.

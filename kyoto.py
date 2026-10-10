@@ -201,6 +201,8 @@ def worker(root):
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return
+        worker_session = uuid.uuid4().hex
+        recovery.write_json(root / 'coordinator.json', dict(pid=os.getpid(), session=worker_session))
         legacy_lock = recovery.inspect_until_available(lambda: recovery.guard_legacy(root))
         db = connect(root)
         active = {}
@@ -230,6 +232,7 @@ def worker(root):
             deferrer.next_action = time.monotonic() + max(0, last_deferral + COOLDOWN_SECONDS - time.time())
         pressure_snapshot = {}
         policy = None
+        recovery_ready = False
         while True:
             now = time.time()
             host_sampled = False
@@ -257,9 +260,11 @@ def worker(root):
                 pressure_snapshot['accounted_rss_mb'] = {j['id']: j['current_rss_mb'] for j in running}
                 pressure_snapshot['config'] = config
                 pressure_snapshot['worker_pid'] = os.getpid()
+                pressure_snapshot['worker_session'] = worker_session
                 pressure_snapshot['supports_auto_defer'] = True
                 pressure_snapshot['supports_command_policy'] = True
                 pressure_snapshot['supports_recovery'] = True
+                pressure_snapshot['recovery_ready'] = recovery_ready
                 db.execute('INSERT INTO runtime (id,value) VALUES (1,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value',
                            (json.dumps(pressure_snapshot),))
                 db.commit()
@@ -339,6 +344,7 @@ def worker(root):
                         active[row['id']] = {'process': process, 'cancelled': False, 'deadline': None}
                     except (OSError, ValueError) as exc:
                         finish(db, row['id'], 'failed', error=str(exc))
+            recovery_ready = True
             time.sleep(.1)
 
 
@@ -348,10 +354,45 @@ def ensure_worker(root):
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            return
+            return False
     with open(root / 'worker.log', 'ab') as log:
         subprocess.Popen([sys.executable, str(Path(__file__).resolve()), '--state', str(root), '_worker'],
                          stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+    return True
+
+
+def worker_ready(root, runtime):
+    coordinator = recovery.read_json(root / 'coordinator.json')
+    if not coordinator or not runtime.get('recovery_ready'):
+        return False
+    if runtime.get('worker_session') != coordinator.get('session') or runtime.get('worker_pid') != coordinator.get('pid'):
+        return False
+    if not 0 <= time.time() - runtime.get('sampled_at', 0) < 10:
+        return False
+    try:
+        os.kill(coordinator['pid'], 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def recover_existing(root, timeout=5):
+    if not (root / 'queue.sqlite').exists():
+        return True
+    ensure_worker(root)
+    deadline = time.monotonic() + timeout
+    db = sqlite3.connect(root / 'queue.sqlite', timeout=.2)
+    try:
+        while True:
+            row = db.execute('SELECT value FROM runtime WHERE id=1').fetchone()
+            runtime = json.loads(row[0]) if row else {}
+            if worker_ready(root, runtime):
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(.1)
+    finally:
+        db.close()
 
 
 def submit_job(db, root, args, parser):
@@ -601,7 +642,7 @@ def main():
     pause = configure.add_mutually_exclusive_group()
     pause.add_argument('--pause', action='store_true')
     pause.add_argument('--resume', action='store_true')
-    dashboard = commands.add_parser('watch', aliases=['tui'], help='Live read-only terminal dashboard')
+    dashboard = commands.add_parser('watch', aliases=['tui'], help='Live terminal dashboard with automatic worker recovery')
     dashboard.add_argument('--once', action='store_true', help='Print one plain-text snapshot')
     dashboard.add_argument('--interval', type=positive_float, default=1, help='Refresh interval in seconds')
     dashboard.add_argument('--history', type=positive_int, default=None, help='Initially load this many completed jobs; default: all history')
@@ -624,6 +665,9 @@ def main():
             p.add_argument('--force', action='store_true', help='Explicitly bypass ownership, including legacy ownerless jobs')
     args = parser.parse_args()
     root = Path(args.state).expanduser().resolve()
+    if args.action not in ('_worker', 'submit', 'config', 'cancel', 'policy', 'watch', 'tui', 'wait'):
+        if recover_existing(root) is False:
+            parser.exit(3, 'Worker recovery incomplete; saved job states are not verified. Retry shortly or inspect worker.log.\n')
     if args.action in ('watch', 'tui'):
         from dashboard import watch
         return watch(root, args.interval, args.history, args.once)
@@ -673,6 +717,8 @@ def main():
         result = read_policy(db)
         if args.policy_action != 'show':
             result['rejected_queued_jobs'] = rejected
+        if recover_existing(root) is False:
+            print('Worker recovery incomplete; policy is saved but job states are not verified.', file=sys.stderr)
         print(json.dumps(result))
     elif args.action == 'config':
         updates = {key: getattr(args, key) for key in DEFAULT_CONFIG if getattr(args, key) is not None}
@@ -684,13 +730,13 @@ def main():
         for key, value in updates.items():
             db.execute('INSERT INTO settings (key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', (key, json.dumps(value)))
         db.commit()
-        if updates:
-            ensure_worker(root)
+        if recover_existing(root) is False:
+            print('Worker recovery incomplete; configuration is saved but job states are not verified.', file=sys.stderr)
         print(json.dumps(config_for(db)))
     elif args.action == 'health':
         runtime = runtime_for(db)
         print(json.dumps({'config': config_for(db), 'runtime': runtime,
-                          'sample_fresh': bool(runtime and time.time() - runtime['sampled_at'] < 10)}))
+                          'sample_fresh': bool(runtime and runtime.get('recovery_ready', True) and time.time() - runtime['sampled_at'] < 10)}))
     elif args.action == 'submit':
         submit_job(db, root, args, parser)
     elif args.action in ('start', 'status'):

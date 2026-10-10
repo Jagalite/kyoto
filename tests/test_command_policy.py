@@ -87,7 +87,7 @@ class PolicyTest(unittest.TestCase):
         original=kyoto.connect
         def tracked(*args,**kwargs):
             db=original(*args,**kwargs);connections.append(db);return db
-        with patch('sys.argv',['kyoto','--state',str(self.root),*args]), patch('kyoto.connect',tracked), patch('kyoto.ensure_worker'), contextlib.redirect_stdout(output), contextlib.redirect_stderr(io.StringIO()):
+        with patch('sys.argv',['kyoto','--state',str(self.root),*args]), patch('kyoto.connect',tracked), patch('kyoto.ensure_worker'), patch('kyoto.recover_existing', return_value=True), contextlib.redirect_stdout(output), contextlib.redirect_stderr(io.StringIO()):
             try: kyoto.main()
             finally:
                 for db in connections: db.close()

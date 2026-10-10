@@ -14,7 +14,7 @@ import kyoto
 class PlanTest(unittest.TestCase):
     def invoke(self, root, *options):
         out = io.StringIO()
-        with patch('sys.argv', ['kyoto', '--state', str(root), 'plan', *options]), patch.dict(os.environ, {'KYOTO_USER_ID': '00000000-0000-0000-0000-000000000001'}), patch('kyoto.ensure_worker') as worker, contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+        with patch('sys.argv', ['kyoto', '--state', str(root), 'plan', *options]), patch.dict(os.environ, {'KYOTO_USER_ID': '00000000-0000-0000-0000-000000000001'}), patch('kyoto.recover_existing'), patch('kyoto.ensure_worker') as worker, contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
             kyoto.main()
             worker.assert_not_called()
         return json.loads(out.getvalue())

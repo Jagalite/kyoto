@@ -1,4 +1,4 @@
-"""Read-only terminal observer; never starts or changes scheduler jobs."""
+"""Terminal observer with automatic worker recovery."""
 import curses
 import datetime
 import json
@@ -9,6 +9,7 @@ import shlex
 import sqlite3
 import sys
 import time
+import threading
 import unicodedata
 
 from commands import classify
@@ -75,7 +76,7 @@ def read_snapshot(root, history=None):
             job['progress'] = job_progress(root, job, snapshot['now']) if job['status'] == 'running' else {}
         runtime = snapshot['runtime']
         config = snapshot['config']
-        fresh = bool(runtime and snapshot['now'] - runtime['sampled_at'] < 10 and dict(DEFAULT_CONFIG, **runtime.get('config', {})) == config)
+        fresh = bool(runtime and runtime.get('recovery_ready', True) and snapshot['now'] - runtime['sampled_at'] < 10 and dict(DEFAULT_CONFIG, **runtime.get('config', {})) == config)
         snapshot['fresh'] = fresh
         if config['paused']:
             snapshot['reason'] = 'Queue paused; running commands continue'
@@ -416,7 +417,29 @@ def draw_dashboard(screen, snapshot, root, selected, logs, styles, error=None):
                 put(top + 4, x, 'Estimate ' + duration(job['estimate']) + (' · no history' if not job['samples'] else '') + ' · memory est ' + memory(job['memory_mb']), 'muted', panel_width)
     put(height - 2, 2, '↑↓/PgUp/PgDn scroll   enter logs' + (' · on' if logs else '') + '   r refresh   q quit', 'muted')
     if width >= 100:
-        put(height - 2, width - 25, 'read-only · ? unlearned', 'muted')
+        put(height - 2, width - 25, 'auto-recover · ? unlearned', 'muted')
+
+
+class WorkerRecovery:
+    """Keep disk access and process startup off the curses input thread."""
+    def __init__(self, root):
+        self.root = root
+        self.thread = None
+        self.message = 'Recovering worker; saved job states are not verified'
+
+    def refresh(self):
+        if self.thread is None or not self.thread.is_alive():
+            self.thread = threading.Thread(target=self.run, daemon=True)
+            self.thread.start()
+        return self.message
+
+    def run(self):
+        from kyoto import recover_existing
+        try:
+            ready = recover_existing(self.root, timeout=0)
+            self.message = None if ready else 'Recovering worker; saved job states are not verified'
+        except (OSError, sqlite3.Error, ValueError, KeyError) as exc:
+            self.message = 'Worker recovery failed: ' + clean(exc)
 
 
 def screen_loop(screen, root, interval, history, sizes):
@@ -434,11 +457,15 @@ def screen_loop(screen, root, interval, history, sizes):
     error = None
     next_refresh = 0
     pending_steps = 0
+    worker_recovery = WorkerRecovery(root)
     while True:
         if time.monotonic() >= next_refresh:
             try:
+                recovery_message = worker_recovery.refresh()
                 snapshot = read_snapshot(root, history)
-                error = None
+                error = recovery_message
+                if recovery_message:
+                    snapshot['fresh'] = False
             except (sqlite3.Error, OSError, ValueError, KeyError) as exc:
                 error = 'Refresh failed (showing previous snapshot): ' + clean(exc)
             jobs = snapshot['jobs']
@@ -478,6 +505,10 @@ def screen_loop(screen, root, interval, history, sizes):
 def watch(root, interval=1, history=None, once=False):
     if once or not (sys.stdin.isatty() and sys.stdout.isatty()):
         try:
+            from kyoto import recover_existing
+            if recover_existing(root) is False:
+                print('Worker recovery incomplete; saved job states are not verified. Retry shortly or inspect worker.log.', file=sys.stderr)
+                return 3
             snapshot = read_snapshot(root, history)
             sizes = TargetSizes(root)
             try:

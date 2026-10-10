@@ -33,7 +33,7 @@ class OwnershipTest(unittest.TestCase):
             db = original(root)
             connections.append(db)
             return db
-        with patch.dict(os.environ, env, clear=True), patch('sys.argv', ['kyoto', '--state', str(self.root), *args]), patch('kyoto.ensure_worker'), patch('kyoto.connect', tracked), contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+        with patch.dict(os.environ, env, clear=True), patch('sys.argv', ['kyoto', '--state', str(self.root), *args]), patch('kyoto.ensure_worker'), patch('kyoto.recover_existing', return_value=True), patch('kyoto.connect', tracked), contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
             try:
                 kyoto.main()
             finally:

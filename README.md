@@ -158,8 +158,14 @@ auto-deferral if a build performs work that must not be repeated.
 
 ## Worker recovery
 
-`kyoto.py start` restarts a missing scheduler; `wait` also checks for one
-periodically. Each new job runs under an independent runner that saves its
+Commands automatically restart a missing scheduler for an existing queue,
+including `watch`, status commands, and `plan`. The dashboard and `wait` keep
+checking while open. A preview can recover the existing queue but never submits
+its proposed job. Status commands wait briefly for stale job states to be reconciled and exit
+with code 3 if recovery is incomplete, rather than presenting unverified states.
+The dashboard recovers in the background and remains responsive. Readiness is
+bound to the current worker instance, not just a recent timestamp.
+Each new job runs under an independent runner that saves its
 process identity and exit result in the state directory. Restarting the scheduler
 preserves running jobs, their slots, explicit resource locks, and cancellation.
 Build processes do not hold the scheduler lock.
