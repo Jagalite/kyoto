@@ -309,6 +309,8 @@ def draw_dashboard(screen, snapshot, root, selected, logs, styles, error=None):
     for index, job in enumerate(jobs):
         group = 'RUNNING' if job['status'] == 'running' else 'WAITING · PLANNED ORDER' if job['status'] == 'queued' else 'RECENT'
         if group != previous_group:
+            if previous_group is not None:
+                entries.append(('spacer', None, None))
             label = group + (' · scroll for older jobs' if group == 'RECENT' and snapshot.get('more_history') else '')
             entries.append(('section', label, None))
             previous_group = group
@@ -318,6 +320,8 @@ def draw_dashboard(screen, snapshot, root, selected, logs, styles, error=None):
     offset = max(0, positions.get(selected, 0) + 2 - visible)
     for line, (kind, value, index) in enumerate(entries[offset:offset + visible]):
         row = 7 + line
+        if kind == 'spacer':
+            continue
         if kind == 'section':
             put(row, 2, value, 'muted')
             continue
