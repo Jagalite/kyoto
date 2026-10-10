@@ -2,6 +2,7 @@
 import curses
 import datetime
 import json
+import os
 from pathlib import Path
 import re
 import shlex
@@ -40,7 +41,7 @@ def memory(mb):
     return f'{mb / 1024:.1f}GiB' if mb >= 1024 else f'{mb:.0f}MiB'
 
 
-def read_snapshot(root, history=6):
+def read_snapshot(root, history=None):
     snapshot = dict(config=dict(DEFAULT_CONFIG, paused=False), runtime=None, jobs=[],
                     now=time.time(), fresh=False, reason='No queue database yet', active_count=0)
     path = root / 'queue.sqlite'
@@ -63,8 +64,8 @@ def read_snapshot(root, history=6):
         for name in ('deferral_count', 'deferring', 'not_before'):
             columns += ', ' + name if name in existing else ', 0 AS ' + name
         active = [dict(r) for r in db.execute('SELECT ' + columns + " FROM jobs WHERE status IN ('queued','running') ORDER BY CASE status WHEN 'running' THEN 0 ELSE 1 END, submitted, id")]
-        recent = [dict(r) for r in db.execute('SELECT ' + columns + " FROM jobs WHERE status NOT IN ('queued','running') ORDER BY finished DESC, id DESC LIMIT ?", (history + 1,))]
-        snapshot['more_history'] = len(recent) > history
+        recent = [dict(r) for r in db.execute('SELECT ' + columns + " FROM jobs WHERE status NOT IN ('queued','running') ORDER BY finished DESC, id DESC LIMIT ?", (history + 1 if history is not None else -1,))]
+        snapshot['more_history'] = history is not None and len(recent) > history
         recent = recent[:history]
         snapshot['active_count'] = len(active)
         snapshot['jobs'] = active + recent
@@ -145,6 +146,13 @@ def scheduling_summary(snapshot):
     return reason[:1].upper() + reason[1:]
 
 
+def cpu_summary(host):
+    count = host.get('cpu_count') or os.cpu_count()
+    percent = host.get('cpu_percent')
+    usage = f'{percent:.0f}%' if percent is not None else '?'
+    return f"CPU {usage} · {count if count is not None else '?'} CPUs"
+
+
 def headers(snapshot):
     config = snapshot['config']
     runtime = snapshot['runtime'] or {}
@@ -155,7 +163,7 @@ def headers(snapshot):
     return [
         f"KYOTO  {config['mode']} / {config['max_running']}  |  {running} running, {queued} queued  |  limit {effective}  |  {datetime.datetime.fromtimestamp(snapshot['now']).strftime('%H:%M:%S')}",
         f"Memory available {memory(runtime.get('available_mb'))}  |  pressure {runtime.get('pressure', '-')} ({sample})",
-        memory_summary(runtime) + '  ·  ' + swap_summary(runtime),
+        cpu_summary(runtime) + '  ·  ' + memory_summary(runtime) + '  ·  ' + swap_summary(runtime),
         scheduling_summary(snapshot),
     ]
 
@@ -229,14 +237,15 @@ def clipped(text, width):
 def palette():
     styles = {'text': 0, 'muted': curses.A_DIM, 'accent': curses.A_BOLD,
               'good': curses.A_BOLD, 'warn': curses.A_BOLD, 'bad': curses.A_BOLD,
-              'selected': curses.A_BOLD}
+              'selected': curses.A_BOLD, 'history': curses.A_BOLD, 'info': 0}
     if curses.has_colors():
         try:
             curses.start_color()
             curses.use_default_colors()
             for index, (name, foreground) in enumerate((('accent', curses.COLOR_CYAN),
                     ('good', curses.COLOR_GREEN), ('warn', curses.COLOR_YELLOW),
-                    ('bad', curses.COLOR_RED)), 1):
+                    ('bad', curses.COLOR_RED), ('history', curses.COLOR_MAGENTA),
+                    ('info', curses.COLOR_CYAN)), 1):
                 curses.init_pair(index, foreground, -1)
                 styles[name] = curses.color_pair(index) | curses.A_BOLD
         except curses.error:
@@ -283,10 +292,15 @@ def draw_dashboard(screen, snapshot, root, selected, logs, styles, error=None):
     put(3, 2, f'{running} running', 'good')
     put(3, 16, f'{queued} waiting', 'warn' if queued else 'muted')
     cap = str(host.get('effective_max_running', '?')) if snapshot['fresh'] else '?'
-    put(3, 30, 'limit ' + cap, 'muted')
+    put(3, 30, 'limit ' + cap, 'accent')
     pressure = host.get('pressure', 'unknown') if snapshot['fresh'] else 'stale sample'
     put(3, 43, pressure, 'good' if pressure == 'normal' else 'warn')
-    put(4, 2, memory_summary(host), 'muted')
+    cpu_style = 'muted' if not snapshot['fresh'] or host.get('cpu_percent') is None else 'bad' if host['cpu_percent'] >= 90 else 'warn' if host['cpu_percent'] >= 70 else 'good'
+    if width >= 100:
+        put(3, 64, cpu_summary(host), cpu_style)
+    else:
+        put(1, 10, cpu_summary(host), cpu_style, max(1, width - len(mode) - 24))
+    put(4, 2, memory_summary(host), 'warn' if snapshot['fresh'] and host.get('pressure') in ('warning', 'critical') else 'info')
     sampled = host.get('sampled_at')
     if sampled is not None:
         age = max(0, time.time() - sampled)
@@ -294,7 +308,7 @@ def draw_dashboard(screen, snapshot, root, selected, logs, styles, error=None):
         put(2, 2, f'Sample {stamp} · {age:.0f}s ago' + (' · STALE' if not snapshot['fresh'] else ''),
             'muted' if snapshot['fresh'] else 'warn')
     if width >= 100:
-        put(4, 64, swap_summary(host), 'muted')
+        put(4, 64, swap_summary(host), 'warn' if snapshot['fresh'] and ((host.get('swap_in_mb_per_second') or 0) >= 4 or (host.get('swap_out_mb_per_second') or 0) >= 1) else 'info')
     put(5, 2, short(error or scheduling_summary(snapshot), width - 4), 'bad' if error else 'muted')
     put(6, 2, '─' * (width - 4), 'muted')
 
@@ -307,11 +321,11 @@ def draw_dashboard(screen, snapshot, root, selected, logs, styles, error=None):
     previous_group = None
     positions = {}
     for index, job in enumerate(jobs):
-        group = 'RUNNING' if job['status'] == 'running' else 'WAITING · PLANNED ORDER' if job['status'] == 'queued' else 'RECENT'
+        group = 'RUNNING' if job['status'] == 'running' else 'WAITING · PLANNED ORDER' if job['status'] == 'queued' else 'HISTORY'
         if group != previous_group:
             if previous_group is not None:
                 entries.append(('spacer', None, None))
-            label = group + (' · scroll for older jobs' if group == 'RECENT' and snapshot.get('more_history') else '')
+            label = group + (' · scroll for older jobs' if group == 'HISTORY' and snapshot.get('more_history') else '')
             entries.append(('section', label, None))
             previous_group = group
         positions[index] = len(entries)
@@ -323,7 +337,7 @@ def draw_dashboard(screen, snapshot, root, selected, logs, styles, error=None):
         if kind == 'spacer':
             continue
         if kind == 'section':
-            put(row, 2, value, 'muted')
+            put(row, 2, value, 'good' if value.startswith('RUNNING') else 'warn' if value.startswith('WAITING') else 'history')
             continue
         focused = index == selected
         if kind == 'job':
@@ -342,7 +356,9 @@ def draw_dashboard(screen, snapshot, root, selected, logs, styles, error=None):
             if job['cancel'] and job['status'] in ('queued', 'running'):
                 project = short(project + ' (cancelling)', list_width - 4)
             elif job['status'] not in ('running', 'queued'):
-                project = short(project + ' · ' + job['status'], list_width - 4)
+                elapsed = duration(job['finished'] - job['started']) if job['started'] is not None and job['finished'] is not None else '-'
+                suffix = ' · ' + job['status'] + ' · ' + elapsed
+                project = short(Path(job['cwd']).name, max(1, list_width - 4 - len(suffix))) + suffix
             put(row, 2, mark, 'accent')
             put(row, 4, project, state_style, list_width - 2, bold=focused)
         else:
@@ -459,17 +475,19 @@ def screen_loop(screen, root, interval, history, sizes):
         selected_id = jobs[selected]['id'] if jobs else None
 
 
-def watch(root, interval=1, history=6, once=False):
+def watch(root, interval=1, history=None, once=False):
     if once or not (sys.stdin.isatty() and sys.stdout.isatty()):
         try:
             snapshot = read_snapshot(root, history)
             sizes = TargetSizes(root)
             try:
                 deadline = time.monotonic() + 2
-                sizes.update(snapshot['jobs'])
-                while any(j['target_size']['state'] == 'scanning' for j in snapshot['jobs']) and time.monotonic() < deadline:
+                # Full history must not enqueue target scans for every past job.
+                measured_jobs = [j for j in snapshot['jobs'] if j['status'] in ('queued', 'running')]
+                sizes.update(measured_jobs)
+                while any(j['target_size']['state'] == 'scanning' for j in measured_jobs) and time.monotonic() < deadline:
                     time.sleep(.05)
-                    sizes.update(snapshot['jobs'])
+                    sizes.update(measured_jobs)
                 print(plain(snapshot, root))
             finally:
                 sizes.close()

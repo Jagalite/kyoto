@@ -7,6 +7,7 @@ import subprocess
 import sys
 import time
 
+from cpu import sample_ticks, utilization
 from scheduling import bounded_output
 
 SAMPLE_SECONDS = 2
@@ -43,7 +44,11 @@ def parse_linux(meminfo, vmstat, page_bytes, psi=None):
 
 
 def sample_host():
-    result = {'sampled_at': time.time(), 'sample_monotonic': time.monotonic()}
+    result = {'sampled_at': time.time(), 'sample_monotonic': time.monotonic(), 'cpu_count': os.cpu_count()}
+    try:
+        result['cpu_ticks'], result['cpu_idle_indices'] = sample_ticks()
+    except (OSError, ValueError, AttributeError, IndexError):
+        pass
     try:
         result['load_average_1m'] = os.getloadavg()[0]
     except OSError:
@@ -98,6 +103,9 @@ class AdaptiveController:
                     difference = host['swap_' + direction + '_mb'] - self.previous['swap_' + direction + '_mb']
                     if difference >= 0:
                         snapshot['swap_' + direction + '_mb_per_second'] = difference / elapsed
+        snapshot['cpu_percent'] = utilization(
+            self.previous.get('cpu_ticks') if self.previous else None,
+            host['cpu_ticks'], host['cpu_idle_indices']) if 'cpu_ticks' in host else None
         self.previous = dict(host)
         reserve = 0
         reason = 'configured concurrency'

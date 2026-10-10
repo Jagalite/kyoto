@@ -48,7 +48,10 @@ supply `--user-id UUID` for subsequent submissions or cancellation.
 cancellation attempts. Ownership is a guard against mistakes, not authentication.
 
 In the dashboard, use arrows or `j`/`k` to select jobs, Page Up/Down to scroll,
-and Enter to view logs. Older history loads as you scroll. Press `q` to exit;
+and Enter to view logs. Full history loads by default and stays scrollable;
+`--history N` starts with fewer entries and loads more as you scroll. History rows
+show elapsed time. The header shows host-wide CPU utilization from 0–100%,
+measured between samples across all CPUs. Press `q` to exit;
 builds continue running.
 
 Running jobs show compilation or current test-suite progress, including a

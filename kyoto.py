@@ -604,7 +604,7 @@ def main():
     dashboard = commands.add_parser('watch', aliases=['tui'], help='Live read-only terminal dashboard')
     dashboard.add_argument('--once', action='store_true', help='Print one plain-text snapshot')
     dashboard.add_argument('--interval', type=positive_float, default=1, help='Refresh interval in seconds')
-    dashboard.add_argument('--history', type=positive_int, default=6, help='Number of recent completed jobs')
+    dashboard.add_argument('--history', type=positive_int, default=None, help='Initially load this many completed jobs; default: all history')
     commands.add_parser('status')
     commands.add_parser('health', help='Show latest host pressure and effective concurrency')
     commands.add_parser('_worker')

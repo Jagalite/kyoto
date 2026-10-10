@@ -211,13 +211,13 @@ class QueueTest(unittest.TestCase):
     def test_legacy_build_does_not_block_recovery(self):
         import fcntl
         self.cli('config', '--pause', '--max-running', '2')
-        job = self.submit('import time; time.sleep(20)')
+        job = self.submit('import signal; signal.pause()')
         self.worker.terminate()
         self.worker.wait(timeout=5)
         root = Path(self.temp.name)
         with (root / 'worker.lock').open('a') as lock, (root / (job + '.log')).open('ab') as log:
             fcntl.flock(lock, fcntl.LOCK_EX)
-            legacy = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(20)'],
+            legacy = subprocess.Popen([sys.executable, '-c', 'import signal; signal.pause()'],
                                       stdout=log, stderr=log, start_new_session=True, pass_fds=(lock.fileno(),))
         try:
             with sqlite3.connect(root / 'queue.sqlite') as db:

@@ -1,4 +1,7 @@
 import json
+import contextlib
+import io
+from unittest.mock import patch
 import os
 from pathlib import Path
 import subprocess
@@ -6,13 +9,17 @@ import sys
 import tempfile
 import unittest
 
-from dashboard import clean, clipped, log_tail, plain, read_snapshot
+from dashboard import clean, clipped, log_tail, plain, read_snapshot, watch, cpu_summary
 from kyoto import connect
 
 SCRIPT = str(Path(__file__).resolve().parents[1] / 'kyoto.py')
 
 
 class DashboardTest(unittest.TestCase):
+    def test_cpu_header_uses_utilization_not_load(self):
+        self.assertEqual(cpu_summary(dict(cpu_count=8, cpu_percent=37.2, load_average_1m=12)), 'CPU 37% · 8 CPUs')
+        self.assertEqual(cpu_summary(dict(cpu_count=8)), 'CPU ? · 8 CPUs')
+
     def test_empty_dashboard_does_not_create_state(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / 'missing'
@@ -73,6 +80,13 @@ class DashboardTest(unittest.TestCase):
             self.assertTrue(first['more_history'])
             self.assertTrue(expanded['more_history'])
             self.assertFalse(last['more_history'])
+            complete = read_snapshot(root)
+            self.assertEqual(len(complete['jobs']), 35)
+            self.assertFalse(complete['more_history'])
+            with patch('dashboard.TargetSizes') as sizes, contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(watch(root, once=True), 0)
+                sizes.return_value.update.assert_called_once_with([])
+                self.assertEqual(output.getvalue().count('succeeded'), 35)
             self.assertEqual([j['id'] for j in first['jobs']], [j['id'] for j in expanded['jobs'][:6]])
 
     def test_log_tail_is_bounded_and_terminal_control_safe(self):

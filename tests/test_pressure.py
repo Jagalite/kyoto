@@ -111,5 +111,28 @@ class PressureTest(unittest.TestCase):
             self.assertFalse(sample_host()['valid'])
 
 
+class CPUUsageTest(unittest.TestCase):
+    def test_cpu_tick_deltas_and_unavailable_samples(self):
+        from cpu import utilization
+        self.assertEqual(utilization([100, 100, 100, 0], [125, 125, 150, 0], [2]), 50)
+        self.assertEqual(utilization([0] * 8, [20, 0, 10, 50, 20, 0, 0, 0], [3, 4]), 30)
+        self.assertIsNone(utilization(None, [1, 2, 3, 4], [2]))
+        self.assertIsNone(utilization([1, 2, 3, 4], [1, 2, 3, 4], [2]))
+        self.assertIsNone(utilization([100, 0, 0, 0], [1, 0, 0, 0], [2]))
+
+    def test_controller_reports_cpu_percentage(self):
+        controller = AdaptiveController()
+        controller.update(DEFAULT_CONFIG, host(0, cpu_ticks=[0, 0, 0, 0], cpu_idle_indices=[2]), [], [], 0)
+        _, result = controller.update(DEFAULT_CONFIG, host(2, cpu_ticks=[20, 10, 70, 0], cpu_idle_indices=[2]), [], [], 2)
+        self.assertEqual(result['cpu_percent'], 30)
+
+    def test_linux_sampler_excludes_double_counted_guest_ticks(self):
+        from cpu import sample_ticks
+        with patch('cpu.sys.platform', 'linux'), patch('cpu.Path.read_text', return_value='cpu 10 20 30 40 50 60 70 80 90 100\n'):
+            ticks, idle = sample_ticks()
+        self.assertEqual(ticks, [10, 20, 30, 40, 50, 60, 70, 80])
+        self.assertEqual(idle, [3, 4])
+
+
 if __name__ == '__main__':
     unittest.main()
