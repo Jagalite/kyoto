@@ -4,65 +4,42 @@ A local command queue for Rust builds across projects and agents. Kyoto schedule
 jobs with automatic concurrency, monitors memory pressure and swap activity,
 and provides a live terminal dashboard. Cargo manages its own build locks.
 
+Kyoto lets local agents coordinate their Rust builds and tests through a shared
+queue, reducing resource contention across projects and worktrees.
+
 Requires Python 3.9+ on macOS or Linux. No Python packages to install.
+
+![Kyoto dashboard showing running builds, planned jobs, history, and job details with fictional example data](docs/images/dashboard-preview.png)
 
 ## Install
 
 ```sh
 git clone https://github.com/Jagalite/kyoto.git
 cd kyoto
-export PATH="$PWD:$PATH"
 ```
 
 Add the checkout directory to your shell's `PATH` to use Kyoto in future terminals.
 
 ## Run
 
-From any project directory:
+Humans can watch the live queue:
 
 ```sh
-# Generate once per agent session and reuse across projects.
-export KYOTO_USER_ID="$(python3 -c 'import uuid; print(uuid.uuid4())')"
-
-kyoto.py submit -- cargo check --workspace
-kyoto.py submit -- cargo build --release
 kyoto.py watch
 ```
 
-The worker starts automatically. Submissions return JSON with a job `id` and
-`owner_id`. Jobs keep their original working directory and environment. Smart
-scheduling and automatic concurrency are enabled by default.
+Agents can run the following commands from their project directory:
 
 ```sh
-kyoto.py plan -- cargo build --release  # Preview cost and queue position
-kyoto.py jobs --mine                    # List this agent's jobs
-kyoto.py status                         # Shared queue and estimates
-kyoto.py logs JOB_ID
-kyoto.py wait JOB_ID                    # Wait and return the job's exit status
-kyoto.py cancel JOB_ID                  # Requires the matching owner identity
+kyoto.py submit -- cargo check --workspace  # Submit a Rust command
+kyoto.py plan -- cargo build --release      # Preview cost and queue position
+kyoto.py status                             # View the shared queue
+kyoto.py show JOB_ID                        # Inspect a job
+kyoto.py logs JOB_ID                        # Read its output
+kyoto.py wait JOB_ID                        # Wait for completion
+kyoto.py cancel JOB_ID                      # Cancel an owned job
+kyoto.py history                            # View completed jobs
 ```
-
-Without `KYOTO_USER_ID`, each submission generates an owner UUID. Retain it and
-supply `--user-id UUID` for subsequent submissions or cancellation.
-`cancel JOB_ID --force` explicitly overrides ownership; `audit JOB_ID` shows
-cancellation attempts. Ownership is a guard against mistakes, not authentication.
-
-In the dashboard, use arrows or `j`/`k` to select jobs, Page Up/Down to scroll,
-and Enter to view logs. Full history loads by default and stays scrollable;
-`--history N` starts with fewer entries and loads more as you scroll. History rows
-show elapsed time. The header shows host-wide CPU utilization from 0–100%,
-measured between samples across all CPUs. Press `q` to exit;
-builds continue running.
-
-Running jobs show compilation or current test-suite progress, including a
-percentage when Cargo/libtest reports a total. Percentages count build units or
-tests, not elapsed time. Remaining time uses previous successful runs of the
-same command; absent history or an exceeded estimate shows `ETA unknown`.
-New submissions enable Cargo's progress output unless the caller already set
-`CARGO_TERM_PROGRESS_WHEN`. Explicit quiet/JSON output or custom test runners
-may omit counters. Progress is parsed from the latest 1 MiB of each log; missing
-suite headers or totals show no percentage. `status` and `show` expose the same
-information in their `progress` field.
 
 ## Tests and scheduling
 
@@ -180,6 +157,10 @@ them. The same applies if a new job loses its runner and no exit result survives
 Do not delete lock files to recover the scheduler.
 
 ## Development
+
+Agents are encouraged to modify these scripts to change whatever they want,
+including scheduling, resource controls, commands, and the dashboard. Adapt Kyoto
+to your own workflows and preferences.
 
 ```sh
 python3 -m unittest discover -s tests -v
