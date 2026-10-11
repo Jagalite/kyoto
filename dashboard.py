@@ -284,6 +284,9 @@ def draw_dashboard(screen, snapshot, root, selected, logs, styles, error=None):
     config = snapshot['config']
     host = snapshot['runtime'] or {}
     jobs = snapshot['jobs']
+    # Animate on redraws without increasing database or host sampling frequency.
+    live = snapshot['fresh'] and not error and 0 <= time.time() - host.get('sampled_at', 0) < 10
+    spinner = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'[int(time.monotonic() * 4) % 10] if live else '·'
     running = sum(j['status'] == 'running' for j in jobs)
     queued = sum(j['status'] == 'queued' for j in jobs)
     put(1, 2, 'KYOTO', 'accent')
@@ -362,6 +365,8 @@ def draw_dashboard(screen, snapshot, root, selected, logs, styles, error=None):
                 suffix = ' · ' + job['status'] + ' · ' + elapsed
                 project = short(Path(job['cwd']).name, max(1, list_width - 4 - len(suffix))) + suffix
             put(row, 2, mark, 'accent')
+            if job['status'] == 'running':
+                project = spinner + ' ' + project
             put(row, 4, project, state_style, list_width - 2, bold=focused)
         else:
             put(row, 4, short(shlex.join(value['command']), list_width - 3), 'muted', list_width - 2, bold=focused)
