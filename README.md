@@ -129,15 +129,18 @@ not arbitrary shell scripts or code inside build scripts/custom aliases.
 
 ## Automatic deferral
 
-Kyoto can stop and requeue builds when critical memory pressure or heavy swap
-traffic persists for 20 seconds (swap writes at least 1 MiB/s or reads at least
-4 MiB/s). Warning pressure or occupied swap alone does not trigger a kill.
-It selects one job with at least 128 MiB measured RSS, favoring memory relief
-and less elapsed work, sends TERM then KILL if needed, and waits for its process
-group to exit before releasing the slot. It waits 60 seconds before another
-deferral, and the job waits at least 60 seconds plus pressure recovery before
-retrying. Each job can be deferred at most twice; jobs at the cap continue
-running. This is enabled by default alongside pressure monitoring.
+Kyoto stops and requeues one eligible build at a time when memory pressure is
+warning/critical or swap reads/writes reach 64 KiB/s. It requires six stressed
+seconds within a rolling ten-second window, so repeated bursts count. Occupied
+swap alone is not a trigger. It waits at least ten seconds between stops and
+stops reducing concurrency when pressure eases or only one uncancelled job remains.
+
+It favors jobs with more measured RSS and less elapsed work, sends TERM then
+KILL if needed, and waits for the process group to exit before releasing its
+slot. Deferred jobs wait at least 60 seconds plus pressure recovery before
+retrying. There is no per-job deferral cap: a retried build can be deferred again
+if pressure returns. New starts use the same swap threshold. This cannot prevent
+swap caused by other applications or by the one remaining build.
 
 Build, check, clippy and compile-only test/benchmark commands are eligible.
 Other commands require explicit retry permission. Test/benchmark

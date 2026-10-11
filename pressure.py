@@ -8,6 +8,7 @@ import sys
 import time
 
 from cpu import sample_ticks, utilization
+from deferral import SWAP_RATE_MB
 from scheduling import bounded_output
 
 SAMPLE_SECONDS = 2
@@ -115,7 +116,7 @@ class AdaptiveController:
                 reason, blocked = 'host pressure measurement unavailable', True
             elif host.get('pressure') in ('warning', 'critical'):
                 reason, blocked = 'OS memory pressure: ' + host['pressure'], True
-            elif (snapshot['swap_out_mb_per_second'] or 0) >= 1 or (snapshot['swap_in_mb_per_second'] or 0) >= 4:
+            elif (snapshot['swap_out_mb_per_second'] or 0) >= SWAP_RATE_MB or (snapshot['swap_in_mb_per_second'] or 0) >= SWAP_RATE_MB:
                 reason, blocked = 'active swapping', True
         if smart_auto:
             # Start one and observe: costs are hints, never advance reservations.

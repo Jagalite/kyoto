@@ -19,25 +19,73 @@ class DeferralTest(unittest.TestCase):
         return dict(dict(id='a', command_kind='build', status='running', started=0,
                          current_rss_mb=512, deferral_count=0, cancel=0), **extra)
 
-    def test_sustained_actual_pressure_and_retry_eligibility(self):
+    def test_one_at_a_time_until_one_remains(self):
         controller = DeferralController()
-        bad = dict(valid=True, pressure='normal', swap_out_mb_per_second=2)
-        for now in range(0, 20, 2):
-            self.assertIsNone(controller.choose(DEFAULT_CONFIG, bad, [self.job()], now, now))
-        self.assertEqual(controller.choose(DEFAULT_CONFIG, bad, [self.job()], 20, 20)['id'], 'a')
-        for now in range(22, 80, 2):
-            self.assertIsNone(controller.choose(DEFAULT_CONFIG, bad, [self.job()], now, now))
-        self.assertIsNone(controller.choose(DEFAULT_CONFIG, bad, [self.job(deferral_count=2)], 80, 80))
-        self.assertIsNone(controller.choose(DEFAULT_CONFIG, bad, [self.job(command_kind='test-run')], 82, 82))
-        self.assertIsNone(controller.choose(DEFAULT_CONFIG, bad, [self.job(command_kind='test-run', allow_retry=1)], 84, 84))
-        self.assertIsNotNone(controller.choose(DEFAULT_CONFIG, bad, [self.job(command_kind='opaque', allow_retry=1)], 86, 86))
+        bad = dict(valid=True, pressure='warning', swap_used_mb=1000)
+        jobs = [self.job(id='a'), self.job(id='b', current_rss_mb=256), self.job(id='c', current_rss_mb=64)]
+        for now in (0, 2, 4):
+            self.assertIsNone(controller.choose(DEFAULT_CONFIG, bad, jobs, now, now))
+        self.assertEqual(controller.choose(DEFAULT_CONFIG, bad, jobs, 6, 6)['id'], 'a')
+        jobs.pop(0)
+        for now in (8, 10, 12, 14):
+            self.assertIsNone(controller.choose(DEFAULT_CONFIG, bad, jobs, now, now))
+        self.assertEqual(controller.choose(DEFAULT_CONFIG, bad, jobs, 16, 16)['id'], 'b')
+        for now in range(18, 60, 2):
+            self.assertIsNone(controller.choose(DEFAULT_CONFIG, bad, jobs[1:], now, now))
 
-    def test_warning_swap_occupancy_and_disabled_do_not_kill(self):
-        for config, sample in [(DEFAULT_CONFIG, dict(valid=True, pressure='warning', swap_used_mb=5000)),
+    def test_bursts_accumulate_but_relief_stops_deferral(self):
+        controller = DeferralController()
+        jobs = [self.job(), self.job(id='b')]
+        bad = dict(valid=True, pressure='normal', swap_in_mb_per_second=.25)
+        good = dict(valid=True, pressure='normal', swap_used_mb=5000)
+        for now, sample in [(0,bad),(2,bad),(4,good),(6,bad)]:
+            self.assertIsNone(controller.choose(DEFAULT_CONFIG, sample, jobs, now, now))
+        self.assertIsNotNone(controller.choose(DEFAULT_CONFIG, bad, jobs, 8, 8))
+        for now in range(10, 40, 2):
+            self.assertIsNone(controller.choose(DEFAULT_CONFIG, good, jobs, now, now))
+
+    def test_eligibility_and_minimum_count_use_all_running_jobs(self):
+        bad = dict(valid=True, pressure='critical')
+        for kind, retry, expected in [('build',0,True),('test-run',1,False),('opaque',0,False),('opaque',1,True)]:
+            controller = DeferralController()
+            jobs = [self.job(command_kind=kind, allow_retry=retry, deferral_count=5), self.job(id='other')]
+            for now in (0,2,4):
+                controller.choose(DEFAULT_CONFIG,bad,jobs,now,now,eligible_ids={'a'})
+            self.assertEqual(controller.choose(DEFAULT_CONFIG,bad,jobs,6,6,eligible_ids={'a'}) is not None, expected)
+        for other in [self.job(id='other', cancel=1), self.job(id='other',deferring=1)]:
+            controller = DeferralController()
+            for now in range(0,30,2):
+                self.assertIsNone(controller.choose(DEFAULT_CONFIG,bad,[self.job(),other],now,now))
+        controller = DeferralController()
+        jobs = [self.job(), self.job(id='b'), self.job(id='stopping', deferring=1)]
+        for now in range(0, 30, 2):
+            self.assertIsNone(controller.choose(DEFAULT_CONFIG, bad, jobs, now, now))
+
+    def test_swap_occupancy_disabled_and_missing_samples_do_not_kill(self):
+        for config, sample in [(DEFAULT_CONFIG, dict(valid=True, pressure='normal', swap_used_mb=5000)),
+                               (DEFAULT_CONFIG, dict(valid=False, pressure='critical')),
                                (dict(DEFAULT_CONFIG, auto_defer=False), dict(valid=True, pressure='critical'))]:
             controller = DeferralController()
             for now in range(0, 100, 2):
-                self.assertIsNone(controller.choose(config, sample, [self.job()], now, now))
+                self.assertIsNone(controller.choose(config, sample, [self.job(), self.job(id='b')], now, now))
+        controller = DeferralController()
+        for now in (0, 20, 40):
+            self.assertIsNone(controller.choose(DEFAULT_CONFIG, dict(valid=True,pressure='critical'), [self.job(),self.job(id='b')], now,now))
+
+    def test_missing_or_disabled_monitoring_resets_pressure_window(self):
+        bad = dict(valid=True, pressure='warning')
+        jobs = [self.job(), self.job(id='b')]
+        for config, sample in [
+                (DEFAULT_CONFIG, dict(valid=False)),
+                (dict(DEFAULT_CONFIG, auto_defer=False), bad),
+                (dict(DEFAULT_CONFIG, pressure_aware=False), bad)]:
+            controller = DeferralController()
+            for now in (0, 2, 4):
+                self.assertIsNone(controller.choose(DEFAULT_CONFIG, bad, jobs, now, now))
+            self.assertIsNone(controller.choose(config, sample, jobs, 6, 6))
+            for now in (8, 10, 12):
+                self.assertIsNone(controller.choose(DEFAULT_CONFIG, bad, jobs, now, now))
+            self.assertIsNotNone(controller.choose(DEFAULT_CONFIG, bad, jobs, 14, 14))
 
     def test_requeue_and_cancel_race_preserve_identity(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -79,12 +127,15 @@ class DeferralTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             db = kyoto.connect(root)
-            db.execute("INSERT INTO settings VALUES ('max_running','1')")
+            db.execute("INSERT INTO settings VALUES ('max_running','2')")
             marker = root/'attempt'
             command = [sys.executable, '-c', "from pathlib import Path; import time; p=Path(" + repr(str(marker)) + "); old=p.exists(); p.write_text('retry' if old else 'first'); time.sleep(0 if old else 20)"]
             db.execute('''INSERT INTO jobs(id,command,cwd,environment,status,submitted,estimate,samples,resources,allow_retry)
                           VALUES ('job',?,?,?,'queued',?,1,0,'[]',1)''',
                        (json.dumps(command), str(root), json.dumps(dict(os.environ)), time.time()))
+            db.execute('''INSERT INTO jobs(id,command,cwd,environment,status,submitted,estimate,samples,resources)
+                          VALUES ('other',?,?,?,'queued',?,1,0,'[]')''',
+                       (json.dumps([sys.executable, '-c', 'import time; time.sleep(3)']), str(root), json.dumps(dict(os.environ)), time.time()))
             db.commit()
             driver = '''import time, kyoto, pressure, deferral
 from pathlib import Path
@@ -106,10 +157,12 @@ kyoto.worker(Path(FOLDER))
                 deadline = time.monotonic()+15
                 while time.monotonic()<deadline:
                     row = dict(db.execute("SELECT * FROM jobs WHERE id='job'").fetchone())
-                    if row['status'] in ('succeeded','failed'):
+                    other_status = db.execute("SELECT status FROM jobs WHERE id='other'").fetchone()[0]
+                    if row['status'] in ('succeeded','failed') and other_status == 'succeeded':
                         break
                     time.sleep(.1)
                 self.assertEqual(row['status'], 'succeeded')
+                self.assertEqual(other_status, 'succeeded')
                 self.assertEqual(row['deferral_count'], 1)
                 self.assertEqual(marker.read_text(), 'retry')
                 self.assertIsNotNone(db.execute('SELECT finished FROM deferred_attempts').fetchone()[0])

@@ -48,6 +48,14 @@ class PressureTest(unittest.TestCase):
         self.assertIsNone(choose_job([job('next')], running, policy, 0, 10000)[0])
         self.assertEqual(len(running), 2)
 
+    def test_modest_swap_reads_and_writes_block_admission(self):
+        for counter in ('swap_in_mb', 'swap_out_mb'):
+            self.controller = AdaptiveController()
+            self.update(0)
+            policy, snapshot = self.update(2, {counter: 100.125})
+            self.assertEqual(policy['max_running'], 0)
+            self.assertEqual(snapshot['admission_reason'], 'active swapping')
+
     def test_fixed_cap_and_fifo_auto(self):
         self.config['mode'] = 'fifo'
         self.assertEqual(self.update(0)[0]['max_running'], 1)

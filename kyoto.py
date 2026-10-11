@@ -20,7 +20,7 @@ import recovery
 from commands import PRIORS
 from command_policy import initialize as initialize_policy, preset as policy_preset, read_policy, validate_policy, parameter as policy_parameter
 from progress import job_progress
-from deferral import DeferralController, COOLDOWN_SECONDS
+from deferral import DeferralController, COOLDOWN_SECONDS, RELIEF_SECONDS
 from pressure import AdaptiveController, SAMPLE_SECONDS, sample_host
 
 from scheduling import (DEFAULT_CONFIG, choose_job, discover_resources, forecast,
@@ -229,7 +229,7 @@ def worker(root):
         deferrer = DeferralController()
         last_deferral = db.execute('SELECT MAX(requested) FROM deferred_attempts').fetchone()[0]
         if last_deferral is not None:
-            deferrer.next_action = time.monotonic() + max(0, last_deferral + COOLDOWN_SECONDS - time.time())
+            deferrer.next_action = time.monotonic() + max(0, last_deferral + RELIEF_SECONDS - time.time())
         pressure_snapshot = {}
         policy = None
         recovery_ready = False
@@ -297,9 +297,9 @@ def worker(root):
                     process.signal(signal.SIGKILL if time.monotonic() >= state['deadline'] else signal.SIGTERM)
             if host_sampled and not any(s.get('deferring') for s in active.values()):
                 running = [job_dict(r) for r in db.execute("SELECT * FROM jobs WHERE status='running'")]
-                candidate = deferrer.choose(config, pressure_snapshot,
-                    [j for j in running if j['id'] in active and isinstance(active[j['id']]['process'], recovery.Attempt)
-                     and active[j['id']]['process'].pid and rss_fresh and time.time() - last_sample < 3], time.monotonic(), now)
+                candidate = deferrer.choose(config, pressure_snapshot, running, time.monotonic(), now,
+                    eligible_ids={j['id'] for j in running if j['id'] in active and isinstance(active[j['id']]['process'], recovery.Attempt)
+                                  and active[j['id']]['process'].pid and rss_fresh and time.time() - last_sample < 3})
                 if candidate and begin_deferral(db, candidate['id'], now):
                     state = active[candidate['id']]
                     state['deferring'] = True

@@ -13,6 +13,7 @@ import threading
 import unicodedata
 
 from commands import classify
+from deferral import SWAP_RATE_MB
 from progress import job_progress, progress_label
 from scheduling import DEFAULT_CONFIG, choose_job, execution_plan
 from target_sizes import TargetSizes
@@ -309,7 +310,7 @@ def draw_dashboard(screen, snapshot, root, selected, logs, styles, error=None):
         put(2, 2, f'Sample {stamp} · {age:.0f}s ago' + (' · STALE' if not snapshot['fresh'] else ''),
             'muted' if snapshot['fresh'] else 'warn')
     if width >= 100:
-        put(4, 64, swap_summary(host), 'warn' if snapshot['fresh'] and ((host.get('swap_in_mb_per_second') or 0) >= 4 or (host.get('swap_out_mb_per_second') or 0) >= 1) else 'info')
+        put(4, 64, swap_summary(host), 'warn' if snapshot['fresh'] and ((host.get('swap_in_mb_per_second') or 0) >= SWAP_RATE_MB or (host.get('swap_out_mb_per_second') or 0) >= SWAP_RATE_MB) else 'info')
     put(5, 2, short(error or scheduling_summary(snapshot), width - 4), 'bad' if error else 'muted')
     put(6, 2, '─' * (width - 4), 'muted')
 
