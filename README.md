@@ -84,6 +84,12 @@ through those wrappers.
 
 ## Experimental hill climbing
 
+**Convergence is not qualified.** A closed-loop audit found that the current
+objective can accept lower aggregate progress with heterogeneous commands, and
+a rejected extra slot can remain occupied until a running command finishes.
+Passing behavior tests does not establish optimal throughput. See the
+[reproducible convergence audit](experiments/README.md) for results and limits.
+
 `hill-climb` learns a concurrency limit from **progress per command** and measured
 CPU use, available RAM, swap activity, and disk latency/contention. Smart mode
 remains the default. Try the experiment in its own queue first, using the same
