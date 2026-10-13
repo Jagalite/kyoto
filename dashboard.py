@@ -64,7 +64,7 @@ def read_snapshot(root, history=None):
                    'cpu_slots, memory_mb, current_rss_mb, peak_rss_mb, cpu_seconds, cancel, error, resources')
         existing = {r[1] for r in db.execute('PRAGMA table_info(jobs)')}
         columns += ', owner_id' if 'owner_id' in existing else ', NULL AS owner_id'
-        for name in ('preempt_for', 'estimate_basis'):
+        for name in ('preempt_for', 'estimate_basis', 'attempt_token'):
             columns += ', ' + name if name in existing else ', NULL AS ' + name
         for name in ('deferral_count', 'deferring', 'not_before'):
             columns += ', ' + name if name in existing else ', 0 AS ' + name
@@ -77,7 +77,8 @@ def read_snapshot(root, history=None):
         for job in snapshot['jobs']:
             job['command'] = json.loads(job['command'])
             job['resources'] = json.loads(job['resources'])
-            job['progress'] = job_progress(root, job, snapshot['now']) if job['status'] == 'running' else {}
+            observed = (snapshot['runtime'] or {}).get('job_progress', {}).get(job['id'])
+            job['progress'] = job_progress(root, job, snapshot['now'], observed=observed) if job['status'] == 'running' else {}
         runtime = snapshot['runtime']
         config = snapshot['config']
         fresh = bool(runtime and runtime.get('recovery_ready', True) and snapshot['now'] - runtime['sampled_at'] < 10 and dict(DEFAULT_CONFIG, **runtime.get('config', {})) == config)
@@ -172,6 +173,8 @@ def headers(snapshot):
         f"Memory available {memory(runtime.get('available_mb'))}  |  pressure {runtime.get('pressure', '-')} ({sample})",
         cpu_summary(runtime) + '  ·  ' + memory_summary(runtime) + '  ·  ' + swap_summary(runtime),
         *disk_lines(runtime.get('disk_io')),
+        *(['Experimental hill climb · ' + runtime.get('admission_reason', 'observing')]
+          if snapshot['fresh'] and runtime.get('hill_climb') else []),
         scheduling_summary(snapshot),
     ]
 

@@ -19,7 +19,7 @@ import recovery
 
 from commands import PRIORS
 from command_policy import initialize as initialize_policy, preset as policy_preset, read_policy, validate_policy, parameter as policy_parameter
-from progress import job_progress
+from progress import job_progress, ProgressTracker
 from deferral import DeferralController, COOLDOWN_SECONDS, RELIEF_SECONDS
 from preemption import choose_preemption
 from pressure import AdaptiveController, SAMPLE_SECONDS, sample_host
@@ -120,14 +120,15 @@ def job_dict(row):
     return item
 
 
-def public(row, root):
+def public(row, root, runtime=None):
     item = job_dict(row)
     item.pop('environment', None)
     item.pop('signature', None)
     item['command'] = json.loads(item['command'])
     item['log'] = str(root / (item['id'] + '.log'))
     item['elapsed_seconds'] = ((item['finished'] or time.time()) - item['started']) if item['started'] else None
-    item['progress'] = job_progress(root, item, time.time())
+    observed = (runtime or {}).get('job_progress', {}).get(item['id'])
+    item['progress'] = job_progress(root, item, time.time(), observed=observed)
     item['estimate_source'] = 'recent successful runs' if item['samples'] else item['estimate_basis']
     return item
 
@@ -263,6 +264,7 @@ def worker(root):
         last_host_sample = 0
         last_config = None
         controller = AdaptiveController()
+        progress_tracker = ProgressTracker()
         deferrer = DeferralController()
         next_preemption = 0
         last_deferral = db.execute('SELECT MAX(requested) FROM deferred_attempts').fetchone()[0]
@@ -307,8 +309,14 @@ def worker(root):
             if now - last_host_sample >= SAMPLE_SECONDS or config != last_config:
                 queued = [job_dict(r) for r in db.execute("SELECT * FROM jobs WHERE status='queued' AND cancel=0")]
                 running = [job_dict(r) for r in db.execute("SELECT * FROM jobs WHERE status='running'")]
+                progress_tracker.prune([j['id'] for j in running] if config['mode'] == 'hill-climb' else [])
+                if config['mode'] == 'hill-climb':
+                    for job in running:
+                        job['progress'] = progress_tracker.sample(root, job, now)
                 host = sample_host()
                 policy, pressure_snapshot = controller.update(config, host, queued, running, time.monotonic())
+                if config['mode'] == 'hill-climb':
+                    pressure_snapshot['job_progress'] = {j['id']: j['progress'] for j in running}
                 pressure_snapshot['accounted_rss_mb'] = {j['id']: j['current_rss_mb'] for j in running}
                 pressure_snapshot['config'] = config
                 pressure_snapshot['worker_pid'] = os.getpid()
@@ -317,6 +325,7 @@ def worker(root):
                 pressure_snapshot['supports_command_policy'] = True
                 pressure_snapshot['supports_recovery'] = True
                 pressure_snapshot['supports_restart'] = True
+                pressure_snapshot['supports_hill_climb'] = True
                 pressure_snapshot['signal_errors'] = {job_id: state['signal_error'] for job_id, state in active.items()
                                                       if state.get('signal_error')}
                 pressure_snapshot['recovery_ready'] = recovery_ready
@@ -582,7 +591,7 @@ def status(db, root):
     rows = sorted(rows, key=lambda r: (r['status'] != 'running', positions.get(r['id'], -1)))
     output = []
     for row in rows:
-        item = public(row, root)
+        item = public(row, root, runtime if fresh else None)
         planned_job = plan_by_id.get(row['id'], {})
         item.update({key: planned_job.get(key) for key in ('planned_order', 'planned_wave', 'planned_start_in_seconds', 'planned_finish_in_seconds')})
         item['plan_conditional'] = bool(config['paused'] or not fresh or not policy['max_running'])
@@ -697,8 +706,8 @@ def main():
         rule.add_argument('--scope', choices=['cargo', 'args'], default='cargo', help='Cargo options or arguments after --')
         rule.add_argument('--max-value', type=positive_int, required=action == 'limit')
     configure = commands.add_parser('config', help='Show or update shared live scheduling policy')
-    configure.add_argument('--mode', choices=['fifo', 'smart'])
-    configure.add_argument('--max-running', type=concurrency_limit, help='Positive integer or auto')
+    configure.add_argument('--mode', choices=['fifo', 'smart', 'hill-climb'], help='hill-climb is experimental; learns concurrency from command progress')
+    configure.add_argument('--max-running', type=concurrency_limit, help='Positive integer or auto; upper bound in hill-climb mode')
     configure.add_argument('--pressure-aware', choices=['on', 'off'], help='Gate new starts on memory, swap, and disk pressure')
     configure.add_argument('--auto-defer', choices=['on', 'off'], help='Stop and requeue eligible builds for sustained pressure or short-job priority (default on)')
     configure.add_argument('--cpu-budget', type=positive_int)
@@ -832,7 +841,8 @@ def main():
             parser.error('--mine requires KYOTO_USER_ID')
         where, params = (' WHERE owner_id=?', [owner]) if owner else ('', [])
         rows = db.execute('SELECT * FROM jobs' + where + ' ORDER BY submitted DESC, id LIMIT ?', (*params, args.limit))
-        print(json.dumps([public(r, root) for r in rows]))
+        runtime = runtime_for(db)
+        print(json.dumps([public(r, root, runtime) for r in rows]))
     elif args.action == 'history':
         print(json.dumps([public(r, root) for r in db.execute("SELECT * FROM jobs WHERE status NOT IN ('queued','running') ORDER BY finished DESC LIMIT ?", (args.limit,))]))
     else:
@@ -867,7 +877,7 @@ def main():
                     next_restart_check = time.monotonic() + 1
                 time.sleep(.2)
                 row = db.execute('SELECT * FROM jobs WHERE id=?', (args.id,)).fetchone()
-        print(json.dumps(public(row, root)))
+        print(json.dumps(public(row, root, runtime_for(db))))
         if args.action == 'wait':
             return 0 if row['status'] == 'succeeded' else (row['exit_code'] if row['exit_code'] and 0 < row['exit_code'] < 256 else 1)
     return 0

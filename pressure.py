@@ -11,6 +11,7 @@ from cpu import sample_ticks, utilization
 from disk_io import sample_disks, disk_rates, pressured_disks
 from deferral import SWAP_RATE_MB
 from scheduling import bounded_output
+from hill_climbing import HillClimbingController
 
 SAMPLE_SECONDS = 2
 RAMP_SECONDS = SAMPLE_SECONDS
@@ -89,11 +90,18 @@ class AdaptiveController:
         self.previous = None
         self.limit = 1
         self.last_increase = None
+        self.hill_climber = HillClimbingController()
+        self.mode = None
 
     def update(self, config, host, queued, running, now):
         auto = config['max_running'] == 'auto'
         smart_auto = auto and config['mode'] == 'smart'
-        ceiling = config['cpu_budget'] if smart_auto else (1 if auto else config['max_running'])
+        hill_climb = config['mode'] == 'hill-climb'
+        if self.mode != config['mode']:
+            self.hill_climber = HillClimbingController()
+            self.limit, self.last_increase = 1, None
+            self.mode = config['mode']
+        ceiling = config['cpu_budget'] if smart_auto or (auto and hill_climb) else (1 if auto else config['max_running'])
         aware = config.get('pressure_aware', True)
         snapshot = dict(host)
         snapshot['disk_io'] = disk_rates(self.previous.get('disk_counters') if self.previous else None,
@@ -141,6 +149,12 @@ class AdaptiveController:
             ceiling = min(ceiling, 1)
             if not blocked:
                 reason = 'disk pressure: ' + ', '.join(snapshot['pressured_disks']) + '; limiting to one running job'
+        if hill_climb:
+            snapshot.update(effective_max_running=0 if blocked else ceiling,
+                            concurrency_ceiling=ceiling, admission_reason=reason,
+                            effective_memory_reserve_mb=reserve, automatic=True,
+                            pressure_aware=aware)
+            return self.hill_climber.update(config, snapshot, queued, running, now)
         if blocked:
             self.limit = 0
             self.last_increase = now

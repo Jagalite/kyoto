@@ -82,6 +82,74 @@ The test restriction recognizes Cargo commands and common wrappers; it does not
 inspect arbitrary shell scripts or custom aliases. Do not submit test execution
 through those wrappers.
 
+## Experimental hill climbing
+
+`hill-climb` learns a concurrency limit from **progress per command** and measured
+CPU use, available RAM, swap activity, and disk latency/contention. Smart mode
+remains the default. Try the experiment in its own queue first, using the same
+`--state` path for every command:
+
+```sh
+python3 kyoto.py --state ~/.local/state/kyoto-hill-climb config --mode hill-climb --max-running auto
+python3 kyoto.py --state ~/.local/state/kyoto-hill-climb submit -- cargo check --workspace
+python3 kyoto.py --state ~/.local/state/kyoto-hill-climb health
+python3 kyoto.py --state ~/.local/state/kyoto-hill-climb watch
+```
+
+The controller starts with one slot, measures a stable window, and tries one
+additional slot when work is waiting. It compares progress rates of the same
+commands before and after the change, retains useful gains, and backs off after
+regression. Observation windows last ten seconds, with twenty seconds between
+trials. An upward trial needs at least a 5% improvement in its pressure-adjusted
+throughput estimate; a downward trial can keep within 3% of the prior estimate
+while using fewer slots. Downward changes drain as commands finish; the optimizer does not
+stop a running command to conduct a trial. Existing pressure-triggered deferral
+still applies to retry-eligible commands when enabled. Short-job preemption is
+specific to smart mode. Explicit resource locks and aging continue to apply.
+
+`--max-running N` is an upper bound in this mode; `auto` uses `--cpu-budget` as
+its upper bound. Missing progress or resource measurements keep admission
+conservative. Phase transitions, retries, counter resets, workload changes,
+and worker restarts require new measurements. No optimizer state is carried
+across worker restarts. The dashboard shows the current decision; `health`
+includes `runtime.hill_climb` diagnostics and `runtime.job_progress` for each
+running command. `show` and `status` expose progress and its source as well.
+
+Cargo progress bars, libtest results, Cargo JSON artifact messages, and ordinary
+`Compiling`/`Checking` lines are recognized automatically. Crate-start counts are
+an activity proxy; they do not mean that crates have finished. Counts and
+percentages refer to the current phase or test suite, not the whole command.
+Commands with no recognized output explicitly report unavailable progress.
+Elapsed time, CPU consumption, and output bytes do not count as useful work.
+
+Any command or wrapper can report its own work counters by writing and flushing
+a line to stdout or stderr:
+
+```text
+KYOTO_PROGRESS {"completed": 42, "total": 100, "phase": "encoding"}
+```
+
+`completed` must be finite and nonnegative; `total`, when supplied, must be
+positive and at least `completed`. Omit `total` when only a count is known.
+Keep the phase and units stable while reporting increasing counters, and change
+the phase when the meaning of a work unit changes. An optional `epoch` string
+can distinguish repeated batches with the same phase. Emit periodically,
+including an initial zero. Kyoto reads existing logs; it does not alter the
+command or run an extra progress probe. Buffered output delays feedback, so flush it.
+
+The objective is an experimental estimate based on relative command rates and
+concurrency, with resource pressure penalties. It is not a benchmark guarantee:
+different crate sizes, command phases, and outside workloads can confound the
+comparison. Disk telemetry currently requires macOS; unavailable telemetry
+prevents aggressive exploration. Planning remains a snapshot at the current
+limit, not a prediction of future optimizer decisions.
+
+To return this queue to the default policy:
+
+```sh
+python3 kyoto.py --state ~/.local/state/kyoto-hill-climb config --mode smart --max-running auto
+```
+
 ## Shared command policy
 
 ```sh
