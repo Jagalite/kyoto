@@ -84,11 +84,12 @@ through those wrappers.
 
 ## Experimental hill climbing
 
-**Convergence is not qualified.** A closed-loop audit found that the current
-objective can accept lower aggregate progress with heterogeneous commands, and
-a rejected extra slot can remain occupied until a running command finishes.
-Passing behavior tests does not establish optimal throughput. See the
-[reproducible convergence audit](experiments/README.md) for results and limits.
+**Experimental; general convergence and hardware performance are not qualified.**
+Closed-loop model tests now settle near the known optimum for finite workloads,
+including noisy observations and mixed job sizes. Sparse counters and changing
+workloads remain imperfect, and a rejected extra slot stays occupied until a
+running command finishes. See the [reproducible convergence audit](experiments/README.md)
+for comparisons with the original implementation and the remaining limits.
 
 `hill-climb` learns a concurrency limit from **progress per command** and measured
 CPU use, available RAM, swap activity, and disk latency/contention. Smart mode
@@ -103,29 +104,44 @@ python3 kyoto.py --state ~/.local/state/kyoto-hill-climb watch
 ```
 
 The controller starts with one slot, measures a stable window, and tries one
-additional slot when work is waiting. It compares progress rates of the same
-commands before and after the change, retains useful gains, and backs off after
-regression. Observation windows last ten seconds, with twenty seconds between
-trials. An upward trial needs at least a 5% improvement in its pressure-adjusted
-throughput estimate; a downward trial can keep within 3% of the prior estimate
-while using fewer slots. Downward changes drain as commands finish; the optimizer does not
+additional slot when work is waiting. Every command with a known phase total
+contributes its measured `delta / total / seconds`; these completed phase
+fractions are summed and adjusted for resource pressure. New commands contribute
+their actual measured progress. An upward trial needs at least a 5% improvement;
+a downward trial can keep within 3% of the prior score while using fewer slots.
+No incumbent may fall below 25% of its prior rate in an accepted trial.
+
+Observation windows start at ten seconds and extend up to ninety seconds when
+counters have not advanced, with twenty seconds between trials. After a rejected
+trial the controller holds its measured limit. A changed command or phase, or a
+sustained rate change exceeding 35% over at least sixty measured seconds, can
+reopen exploration. Holds caused by the configured cap or CPU/RAM headroom are
+released when that constraint relaxes. Downward changes drain as commands finish;
+the optimizer does not
 stop a running command to conduct a trial. Existing pressure-triggered deferral
 still applies to retry-eligible commands when enabled. Short-job preemption is
 specific to smart mode. Explicit resource locks and aging continue to apply.
 
 `--max-running N` is an upper bound in this mode; `auto` uses `--cpu-budget` as
-its upper bound. Missing progress or resource measurements keep admission
-conservative. Phase transitions, retries, counter resets, workload changes,
-and worker restarts require new measurements. No optimizer state is carried
+its upper bound. Missing totals, progress, or resource measurements normally
+keep admission at one slot. A newly admitted command has bounded startup time
+to report its first counter during an upward trial or an ordinary refill of a
+learned limit (120 seconds by default). Refill grace requires a measured surviving
+incumbent. Known commands losing progress do not get this grace period.
+Phase transitions, retries, counter resets, workload changes, and worker restarts
+require new measurements. Ordinary completions preserve the learned limit.
+No optimizer state is carried
 across worker restarts. The dashboard shows the current decision; `health`
-includes `runtime.hill_climb` diagnostics and `runtime.job_progress` for each
+includes `runtime.hill_climb` diagnostics (target, actual running count, drain
+duration, measured rates, hold cause, and trial decisions) and `runtime.job_progress` for each
 running command. `show` and `status` expose progress and its source as well.
 
 Cargo progress bars, libtest results, Cargo JSON artifact messages, and ordinary
 `Compiling`/`Checking` lines are recognized automatically. Crate-start counts are
 an activity proxy; they do not mean that crates have finished. Counts and
 percentages refer to the current phase or test suite, not the whole command.
-Commands with no recognized output explicitly report unavailable progress.
+Unknown-total counters remain progress diagnostics and cannot justify extra
+concurrency. Commands with no recognized output explicitly report unavailable progress.
 Elapsed time, CPU consumption, and output bytes do not count as useful work.
 
 Any command or wrapper can report its own work counters by writing and flushing
@@ -143,10 +159,11 @@ can distinguish repeated batches with the same phase. Emit periodically,
 including an initial zero. Kyoto reads existing logs; it does not alter the
 command or run an extra progress probe. Buffered output delays feedback, so flush it.
 
-The objective is an experimental estimate based on relative command rates and
-concurrency, with resource pressure penalties. It is not a benchmark guarantee:
-different crate sizes, command phases, and outside workloads can confound the
-comparison. Disk telemetry currently requires macOS; unavailable telemetry
+The objective gives each phase equal weight. It measures phase completions per
+second, not a universal work unit: a short test phase and a large build phase
+each count as one. Different phase sizes, job mixes, and outside workloads can
+change the preferred concurrency. Unknown totals never acquire invented
+denominators. Disk telemetry currently requires macOS; unavailable telemetry
 prevents aggressive exploration. Planning remains a snapshot at the current
 limit, not a prediction of future optimizer decisions.
 

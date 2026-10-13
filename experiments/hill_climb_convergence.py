@@ -14,9 +14,13 @@ import hashlib
 import json
 from pathlib import Path
 import random
+import statistics
+import subprocess
 import sys
+import types
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 from hill_climbing import HillClimbingController
 from scheduling import DEFAULT_CONFIG, choose_job
 
@@ -31,6 +35,8 @@ SCENARIOS = {
     'noisy_finite_commands': dict(work=120., spread=.35, noise=.15),
     'sparse_progress': dict(work=120., spread=.35, quantum=25.),
     'bottleneck_changes': dict(work=120., spread=.35, change_at=600.),
+    'mixed_job_sizes': dict(work=120., spread=.85),
+    'delayed_progress': dict(work=120., spread=.35, reporting_delay=6.),
 }
 
 
@@ -42,14 +48,23 @@ def host():
                     read_ms=2., read_iops=50., write_ms=None, write_iops=0.)}))
 
 
-def simulate(settings, seconds, seed, fixed=None):
+def simulate(settings, seconds, seed, fixed=None, *, controller_factory=None):
+    """Run the identical work model with any controller implementing update().
+
+    Raw work is comparable only because this synthetic model assigns common work
+    units to every job. Normalized progress counts achieved / total for each job:
+    one completed job contributes one, regardless of its size. These objectives
+    differ for mixed totals, so neither metric is substituted for the other.
+    """
     rng = random.Random(seed)
     noise_rng = random.Random(seed + 10000)
-    controller = HillClimbingController()
+    controller = (controller_factory or HillClimbingController)() if fixed is None else None
     config = dict(DEFAULT_CONFIG, mode='hill-climb', max_running=8, paused=False)
     active, pending, trace, decisions = [], [], [], []
     completed = 0
     work = late_work = optimal_work = late_optimal_work = 0.
+    normalized_progress = late_normalized_progress = 0.
+    mismatched_seconds = late_mismatched_seconds = 0.
     actual_counts, target_counts, phases = Counter(), Counter(), Counter()
     policy = dict(config, max_running=fixed or 1)
     factor = 1.
@@ -71,22 +86,34 @@ def simulate(settings, seconds, seed, fixed=None):
             optimal_work += ideal
             if now > seconds / 2:
                 late_optimal_work += ideal
+            if len(active) != policy['max_running']:
+                mismatched_seconds += STEP
+                if now > seconds / 2:
+                    late_mismatched_seconds += STEP
             if active:
                 increment = curve[len(active)] * factor * STEP / len(active)
                 for job in active:
                     achieved = min(increment, job['total_work'] - job['work'])
                     job['work'] += achieved
                     work += achieved
+                    normalized_progress += achieved / job['total_work']
                     if now > seconds / 2:
                         late_work += achieved
+                        late_normalized_progress += achieved / job['total_work']
         # Production worker samples before it reaps completions in that pass.
         if tick % SAMPLE_TICKS == 0:
             for job in active:
+                if now - job['started'] < settings.get('reporting_delay', 0.):
+                    # Work continues while startup output is unavailable. The
+                    # first reported value includes that work; it is not a rate
+                    # sample or a fabricated zero-valued counter at admission.
+                    job['progress'] = dict(measurable=False)
+                    continue
                 quantum = settings.get('quantum', 0.)
                 value = (job['work'] // quantum) * quantum if quantum else job['work']
                 job['progress'] = dict(measurable=True, confidence='high', measurement=dict(
                     source='explicit', epoch=job['id'], value=value, total=job['total_work']))
-            if fixed is None:
+            if controller is not None:
                 policy, snapshot = controller.update(config, host(), pending, active, now)
                 latest = snapshot['hill_climb']
                 for decision in latest['decisions']:
@@ -110,10 +137,14 @@ def simulate(settings, seconds, seed, fixed=None):
             job.update(started=now, status='running', attempt_token=job['id'] + '-attempt')
             active.append(job)
         if tick % SAMPLE_TICKS == 0:
+            raw_rate = curve[len(active)] * factor
+            normalized_rate = sum(raw_rate / len(active) / job['total_work'] for job in active)
             entry = dict(at=now, target=policy['max_running'], actual=len(active),
-                         true_rate=curve[len(active)] * factor,
+                         true_rate=raw_rate, true_normalized_rate=normalized_rate,
                          optimal_concurrency=max(range(1, 9), key=lambda n: curve[n]),
-                         completed=completed, work=work,
+                         completed=completed, work=work, normalized_progress=normalized_progress,
+                         measured_objective=latest.get('objective') if latest else None,
+                         objective_kind=latest.get('objective_kind') if latest else None,
                          phase=latest['phase'] if latest else 'fixed',
                          reason=latest['reason'] if latest else 'fixed')
             trace.append(entry)
@@ -124,37 +155,110 @@ def simulate(settings, seconds, seed, fixed=None):
     percent = lambda counts: {str(k): round(100 * v / sum(counts.values()), 2)
                              for k, v in sorted(counts.items())}
     return dict(summary=dict(work=round(work, 3), completed=completed,
+                             normalized_progress=round(normalized_progress, 9),
+                             normalized_progress_per_second=round(normalized_progress / seconds, 9),
+                             late_normalized_progress_per_second=round(2 * late_normalized_progress / seconds, 9),
                              actual_final=len(active), target_final=policy['max_running'],
                              efficiency_percent=round(100 * work / optimal_work, 2),
                              late_efficiency_percent=round(100 * late_work / late_optimal_work, 2),
+                             mismatched_seconds=round(mismatched_seconds, 3),
+                             late_mismatched_seconds=round(late_mismatched_seconds, 3),
                              late_actual_percent=percent(actual_counts),
                              late_target_percent=percent(target_counts), late_phases_percent=percent(phases)),
                 decisions=decisions, trace=trace)
 
 
+def load_controller(source, label):
+    """Load a trusted repository controller without replacing production imports."""
+    digest = hashlib.sha256(source).hexdigest()
+    module = types.ModuleType('_hill_climbing_audit_' + digest)
+    module.__file__ = label
+    exec(compile(source, label, 'exec'), module.__dict__)
+    return module.HillClimbingController, digest
+
+
+def frozen_controller(ref):
+    revision = subprocess.check_output(
+        ['git', 'rev-parse', '--verify', '--end-of-options', ref + '^{commit}'],
+        cwd=ROOT, text=True).strip()
+    source = subprocess.check_output(['git', 'show', revision + ':hill_climbing.py'], cwd=ROOT)
+    factory, digest = load_controller(source, revision + ':hill_climbing.py')
+    return factory, dict(revision=revision, controller_sha256=digest)
+
+
+def comparison(candidate, baseline, references):
+    def change(key):
+        before = baseline[key]
+        return round(100 * (candidate[key] / before - 1), 2) if before else None
+
+    best_raw = max(references, key=lambda n: references[n]['late_efficiency_percent'])
+    best_normalized = max(references, key=lambda n: references[n]['late_normalized_progress_per_second'])
+    normalized_reference = references[best_normalized]['late_normalized_progress_per_second']
+    return dict(raw_work_change_percent=change('work'),
+                late_raw_efficiency_change_points=round(
+                    candidate['late_efficiency_percent'] - baseline['late_efficiency_percent'], 2),
+                normalized_progress_change_percent=change('normalized_progress'),
+                late_normalized_progress_rate_change_percent=change('late_normalized_progress_per_second'),
+                completed_change=candidate['completed'] - baseline['completed'],
+                best_late_raw_fixed=best_raw, best_late_normalized_fixed=best_normalized,
+                late_normalized_percent_of_best_fixed=round(
+                    100 * candidate['late_normalized_progress_per_second'] / normalized_reference, 2)
+                    if normalized_reference else None)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--seconds', type=int, default=1200)
-    parser.add_argument('--seed', type=int, default=7)
+    parser.add_argument('--seed', type=int, default=7, help='single seed when --seeds is omitted')
+    parser.add_argument('--seeds', help='comma-separated independent seeds, e.g. 7,19,41')
+    parser.add_argument('--baseline-ref', default='e3f51af', help='frozen pre-fix controller commit')
+    parser.add_argument('--candidate-controller', type=Path,
+                        help='trusted Python file defining HillClimbingController (defaults to working tree)')
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
     if args.seconds < 10:
         parser.error('--seconds must be at least ten')
-    root = Path(__file__).resolve().parents[1]
-    report = dict(seconds=args.seconds, seed=args.seed, step_seconds=STEP,
+    try:
+        seeds = list(dict.fromkeys(int(seed) for seed in args.seeds.split(','))) if args.seeds else [args.seed]
+    except ValueError:
+        parser.error('--seeds must be a comma-separated list of integers')
+    candidate_path = args.candidate_controller or ROOT / 'hill_climbing.py'
+    candidate_factory, candidate_digest = load_controller(candidate_path.read_bytes(), str(candidate_path))
+    baseline_factory, baseline_provenance = frozen_controller(args.baseline_ref)
+    repository_head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()
+    report = dict(seconds=args.seconds, seeds=seeds, step_seconds=STEP,
                   sample_seconds=STEP * SAMPLE_TICKS, curve=CURVE, changed_curve=CHANGED_CURVE,
-                  model='homogeneous work units; fixed healthy synthetic host; natural completion only',
-                  sha256={name: hashlib.sha256((root / name).read_bytes()).hexdigest()
+                  model='homogeneous raw work units; fixed healthy synthetic host; natural completion only',
+                  metrics=dict(efficiency_percent='raw work / instantaneous known maximum raw throughput',
+                               normalized_progress='sum of achieved work / total work for each command',
+                               fixed_normalized_reference='best independently simulated fixed policy; not an oracle',
+                               measured_objective='controller-reported trial ratio; may use different semantics by revision'),
+                  baseline=baseline_provenance,
+                  candidate=dict(path=str(candidate_path.resolve()), controller_sha256=candidate_digest,
+                                 repository_head=repository_head),
+                  sha256={name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest()
                           for name in ('hill_climbing.py', 'scheduling.py',
-                                       'experiments/hill_climb_convergence.py')}, scenarios={})
+                                       'progress_objective.py', 'experiments/hill_climb_convergence.py')
+                          if (ROOT / name).exists()}, scenarios={})
     for name, settings in SCENARIOS.items():
-        result = simulate(settings, args.seconds, args.seed)
-        result['settings'] = settings
-        # Independent fixed-concurrency runs check the stated throughput optimum.
-        result['fixed_references'] = {str(n): simulate(settings, args.seconds, args.seed, fixed=n)['summary']
-                                      for n in range(1, 9)}
-        report['scenarios'][name] = result
-        print(name + ': ' + json.dumps(result['summary']), flush=True)
+        scenario = dict(settings=settings, runs={})
+        for seed in seeds:
+            result = simulate(settings, args.seconds, seed, controller_factory=candidate_factory)
+            baseline = simulate(settings, args.seconds, seed, controller_factory=baseline_factory)
+            references = {str(n): simulate(settings, args.seconds, seed, fixed=n)['summary'] for n in range(1, 9)}
+            delta = comparison(result['summary'], baseline['summary'], references)
+            scenario['runs'][str(seed)] = dict(candidate=result, baseline=baseline,
+                                               fixed_references=references, comparison=delta)
+            print(f'{name} seed={seed}: ' + json.dumps(dict(candidate=result['summary'],
+                  baseline=baseline['summary'], comparison=delta)), flush=True)
+        scenario['across_seeds'] = {
+            metric: dict(minimum=round(min(values), 3), median=round(statistics.median(values), 3),
+                         maximum=round(max(values), 3))
+            for metric in ('raw_work_change_percent', 'normalized_progress_change_percent',
+                           'late_raw_efficiency_change_points', 'late_normalized_progress_rate_change_percent')
+            if (values := [run['comparison'][metric] for run in scenario['runs'].values()
+                           if run['comparison'][metric] is not None])}
+        report['scenarios'][name] = scenario
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2, allow_nan=False) + '\n')
 

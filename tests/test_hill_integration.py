@@ -135,7 +135,7 @@ class HillIntegrationTest(unittest.TestCase):
         return config
 
     def submit(self, name, *, reporting=False, fixed_progress=False, resource=None,
-               record_starts=False):
+               record_starts=False, delayed_progress=False):
         code = "import json,time\nfrom pathlib import Path\n"
         if record_starts:
             code += f"with Path('starts-{name}').open('a') as marker: marker.write('started\\n')\n"
@@ -147,7 +147,10 @@ class HillIntegrationTest(unittest.TestCase):
         code += f"while not Path('release-{name}').exists() and not Path('finish').exists():\n"
         code += "    if time.monotonic() >= deadline: raise SystemExit(99)\n"
         if reporting:
-            code += "    count += 1\n    print('KYOTO_PROGRESS ' + json.dumps(dict(completed=count,total=100000,phase='work')), flush=True)\n"
+            code += "    count += 1\n"
+            if delayed_progress:
+                code += f"    if Path('report-{name}').exists():\n    "
+            code += "    print('KYOTO_PROGRESS ' + json.dumps(dict(completed=count,total=100000,phase='work')), flush=True)\n"
         code += "    time.sleep(.05)\n"
         options = ['--estimate', '60']
         if resource:
@@ -304,6 +307,42 @@ class HillIntegrationTest(unittest.TestCase):
         for _, change in sorted(events):
             running += change
             self.assertLessEqual(running, 2)
+
+    def test_delayed_replacement_progress_preserves_learned_limit(self):
+        self.configure('--mode', 'hill-climb', '--max-running', '2')
+        first = self.submit('first', reporting=True)
+        incumbent = self.submit('incumbent', reporting=True)
+        replacement = self.submit('replacement', reporting=True, delayed_progress=True)
+        self.configure('--resume')
+        self.wait_for(lambda: self.runtime()['hill_climb']['holding']
+                      and self.runtime()['hill_climb']['target'] == 2,
+                      'qualified two-slot limit')
+        self.assertEqual(self.row(replacement)['status'], 'queued')
+        incumbent_attempt = self.row(incumbent)['attempt_token']
+        self.release('first')
+        self.finished(first)
+        self.wait_for(lambda: replacement in self.runtime().get('job_progress', {}),
+                      'unreported replacement progress')
+        first_sample = self.runtime()['sampled_at']
+        # Keep the real process silent across more than a full test window.
+        self.wait_for(lambda: self.runtime()['sampled_at'] > first_sample + .8,
+                      'bounded replacement startup')
+        sample = self.runtime()
+        self.assertFalse(sample['job_progress'][replacement]['measurable'])
+        self.assertEqual(sample['hill_climb']['target'], 2)
+        self.assertEqual(sample['effective_max_running'], 2)
+        self.assertEqual(self.row(incumbent)['attempt_token'], incumbent_attempt)
+        self.assertEqual(self.row(incumbent)['status'], 'running')
+        (self.root / 'report-replacement').touch()
+        self.wait_for(lambda: self.runtime()['job_progress'][replacement]['measurable'],
+                      'replacement first useful counter')
+        self.wait_for(lambda: replacement in self.runtime()['hill_climb']['per_job_rates'],
+                      'fresh complete progress window')
+        self.assertEqual(self.runtime()['hill_climb']['target'], 2)
+        self.release('incumbent')
+        self.release('replacement')
+        self.finished(incumbent)
+        self.finished(replacement)
 
 
 if __name__ == '__main__':

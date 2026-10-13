@@ -1,15 +1,16 @@
 """Experimental, progress-driven concurrency search; never controls processes.
 
-Command counters have unrelated units. A probe therefore compares each surviving
-command with its own previous rate, then multiplies their mean relative speed by
-the change in occupied slots. This is a dimensionless *throughput estimate*, not
-an assertion that a compiler artifact equals a test or a user work unit. Full
-progress coverage and positive work from every admitted command are required.
+Known totals turn counters into completed phase fractions. A probe compares the
+sum of measured fractions per second before and after changing admission. Every
+active command contributes its own measured rate; unknown totals cannot be scored.
+Each phase has equal weight, which is a policy rather than a claim that arbitrary
+work units have equal value. Rejected trials lead to a stable holding limit.
 Attempts, sources, phases, counter resets, and unexpected cohort changes invalidate
 comparisons. Reducing the target only withholds starts: existing work drains.
 """
 from collections import deque
 import math
+from progress_objective import measure_progress
 
 
 WINDOW_SECONDS = 10
@@ -18,6 +19,9 @@ MAX_GAP_SECONDS = 30
 PROBE_TIMEOUT_SECONDS = 120
 GAIN_THRESHOLD = 1.05
 DOWN_THRESHOLD = .97  # Prefer fewer slots when estimated throughput is tied.
+MAX_WINDOW_SECONDS = 90  # Coarse counters need more than one short silent window.
+CHANGE_SECONDS = 60
+CHANGE_FRACTION = .35
 
 
 def _finite(value):
@@ -92,6 +96,15 @@ class HillClimbingController:
         self.per_job_rates = {}
         self.objective = None
         self.decisions = deque(maxlen=12)
+        self.holding = False
+        self.hold_cause = None
+        self.rejected_limit = None
+        self.reference_rates = {}
+        self.change_work = self.change_expected = self.change_seconds = 0.
+        self.workload = None
+        self.drain_started = None
+        self.attempt_history = {}
+        self.turnover_started = None
 
     def _decision(self, now, action, reason, **details):
         self.reason = reason
@@ -104,12 +117,23 @@ class HillClimbingController:
         self.objective = None
         self.phase = phase
         self.next_direction = 'up'
+        self.holding = False
+        self.hold_cause = None
+        self.rejected_limit = None
+        self.reference_rates = {}
+        self.change_work = self.change_expected = self.change_seconds = 0.
+        self.workload = None
+        self.drain_started = None
+        self.attempt_history = {}
+        self.turnover_started = None
         self.next_probe_at = now + self.cooldown_seconds
         if self.reason != reason:
             self._decision(now, 'reset', reason)
 
     def _abort(self, now, reason):
-        self.target = self.probe['from_target']
+        # An inconclusive downward trial must not admit replacement work while
+        # draining. Its lower target is conservative until it can be remeasured.
+        self.target = min(self.target, self.probe['from_target'])
         self.probe = self.window = None
         self.phase = 'cooldown'
         self.next_probe_at = now + self.cooldown_seconds
@@ -126,7 +150,9 @@ class HillClimbingController:
             return None, False
         old = self.window
         changed = (measurements.keys() != old['samples'].keys()
-                   or any(m['value'] < old['recent'][k]['value'] for k, m in measurements.items()))
+                   or any(m['value'] < old['recent'][k]['value']
+                          or m['total'] != old['recent'][k]['total']
+                          for k, m in measurements.items()))
         if changed:
             self._start_window(now, measurements, factor)
             self.per_job_rates = {}
@@ -137,28 +163,30 @@ class HillClimbingController:
         elapsed = now - old['start']
         if elapsed < self.window_seconds:
             return None, False
-        rates = {key: (m['value'] - old['samples'][key]['value']) / elapsed
-                 for key, m in measurements.items()}
-        if not all(_finite(rate) for rate in rates.values()):
+        result = measure_progress(old['samples'], measurements, elapsed)
+        if not result['valid']:
             self._start_window(now, measurements, factor)
             self.per_job_rates = {}
             return None, True
+        rates = result['rates']
+        self.per_job_rates = result['per_job_rates']
+        # Publish zero-rate diagnostics promptly, but do not confuse ten seconds
+        # of buffered/coarse output with a demonstrated throughput regression.
+        maximum = max(self.window_seconds, min(MAX_WINDOW_SECONDS, self.probe_timeout_seconds * .75))
+        if elapsed < maximum and any(rate == 0 for rate in rates.values()):
+            return None, False
         observation = dict(rates=rates, count=len(rates), factor=old['cost'] / elapsed,
-                           elapsed=elapsed, measurements=measurements)
-        self.per_job_rates = {}
-        for key, rate in rates.items():
-            measurement = measurements[key]
-            total = measurement['total']
-            fraction_rate = rate / total if total else None
-            self.per_job_rates[key[0]] = dict(rate_per_second=rate, source=measurement['source'],
-                epoch=measurement['epoch'], total=total, confidence=measurement['confidence'],
-                fraction_per_second=fraction_rate if _finite(fraction_rate) else None)
+                           elapsed=elapsed, measurements=measurements,
+                           normalized_rates=result['normalized_rates'],
+                           progress_per_second=result['progress_per_second'],
+                           eligible=result['eligible'])
         self._start_window(now, measurements, factor)
         return observation, False
 
     def _begin_probe(self, now, observation, direction):
         self.probe = dict(direction=direction, baseline=observation, from_target=self.target,
-                          started=now, cohort=None, attempts=None, recent=observation['measurements'])
+                          started=now, observing_at=None, cohort=None, attempts=None,
+                          recent=observation['measurements'])
         self.target += 1 if direction == 'up' else -1
         self.window = None
         self.phase = 'probe-up' if direction == 'up' else 'drain-down'
@@ -169,13 +197,16 @@ class HillClimbingController:
         probe = self.probe
         baseline = probe['baseline']
         paired = set(observation['rates']) & set(baseline['rates'])
-        ratios = [observation['rates'][key] / baseline['rates'][key] for key in paired]
-        if not ratios or not all(_finite(ratio) for ratio in ratios):
+        ratios = [observation['rates'][key] / baseline['rates'][key] for key in paired
+                  if baseline['rates'][key] > 0]
+        before, after = baseline.get('progress_per_second'), observation.get('progress_per_second')
+        if (not ratios or not all(_finite(ratio) for ratio in ratios)
+                or not _finite(before) or before <= 0 or not _finite(after)):
             self._abort(now, 'progress comparison is nonfinite; new baseline')
             self.objective = None
             return
         positive = all(rate > 0 for rate in observation['rates'].values())
-        progress_ratio = sum(ratio / len(ratios) for ratio in ratios) * observation['count'] / baseline['count']
+        progress_ratio = after / before
         objective = progress_ratio * observation['factor'] / baseline['factor']
         if not _finite(progress_ratio) or not _finite(objective):
             self._abort(now, 'progress comparison is nonfinite; new baseline')
@@ -186,7 +217,15 @@ class HillClimbingController:
         self.objective = objective
         if not accepted:
             self.target = probe['from_target']
-        self.next_direction = ('up' if probe['direction'] == 'down' else 'down') if not accepted else probe['direction']
+            if probe['direction'] == 'up':
+                self.rejected_limit = self.target + 1
+        self.holding = not accepted
+        self.hold_cause = 'rejected' if self.holding else None
+        self.next_direction = probe['direction']
+        reference = observation if accepted else baseline
+        self.reference_rates = dict(reference['normalized_rates'])
+        self.change_work = self.change_expected = self.change_seconds = 0.
+        self.workload = baseline.get('domains')
         self.probe = None
         self.window = None
         self.next_probe_at = now + self.cooldown_seconds
@@ -194,6 +233,7 @@ class HillClimbingController:
         self._decision(now, 'accepted' if accepted else 'rejected',
                        'progress supports ' + str(self.target) + ' slots' if accepted else 'probe did not improve progress',
                        direction=probe['direction'], objective=objective, progress_ratio=progress_ratio,
+                       progress_per_second=after, baseline_progress_per_second=before,
                        paired_jobs=len(paired), minimum_job_ratio=min(ratios))
 
     def update(self, config, snapshot, queued, running, now):
@@ -203,6 +243,7 @@ class HillClimbingController:
         cap = max(1, min(configured, snapshot.get('concurrency_ceiling', configured)))
         measurements = _measurements(running)
         coverage = len(measurements) / len(running) if running else 0.
+        scoring_coverage = sum(m['total'] is not None for m in measurements.values()) / len(running) if running else 0.
         known, factor, headroom = _resources(snapshot)
         hard_blocked = snapshot.get('effective_max_running') == 0
         clock_reset = self.last_time is not None and (now < self.last_time or now - self.last_time > self.max_gap_seconds)
@@ -220,28 +261,85 @@ class HillClimbingController:
             self.next_probe_at = now
         elif not known:
             self._reset(now, 'host telemetry incomplete; one-slot fallback', phase='unavailable')
-        elif coverage < 1 and not self._newcomer_warmup(running, measurements):
-            self._reset(now, 'command progress incomplete; one-slot fallback', phase='unavailable')
         elif clock_reset:
             self._reset(now, 'observation clock gap; collecting a fresh baseline')
         else:
             if self.target > cap or (self.probe and self.probe['from_target'] > cap):
                 self._reset(now, 'concurrency ceiling changed', target=min(self.target, cap))
-            self._advance(config, now, queued, running, measurements, factor, headroom, cap)
+            if coverage < 1 and not self._newcomer_warmup(running, measurements):
+                if self._turnover_warmup(now, running, measurements):
+                    # Preserve the qualified admission limit while a genuinely
+                    # new replacement emits its first counter. Partial coverage
+                    # can never start an observation or decide another probe.
+                    self.window = None
+                    self.per_job_rates = {}
+                    self.objective = None
+                    self.phase = 'warmup'
+                    self.reason = 'waiting for replacement command progress'
+                else:
+                    expired = (self.turnover_started is not None
+                               and now - self.turnover_started > self.probe_timeout_seconds)
+                    self._reset(now, 'replacement command progress timed out; one-slot fallback' if expired
+                                else 'command progress incomplete; one-slot fallback', phase='unavailable')
+            elif coverage == 1 and scoring_coverage < 1:
+                self._reset(now, 'command progress totals unknown; cannot compare phase completion', phase='unavailable')
+            else:
+                self._advance(config, now, queued, running, measurements, factor, headroom, cap)
+        self._remember_attempts(now, running, measurements)
         self.target = min(self.target, cap)
         effective = 0 if hard_blocked or config.get('paused') else self.target
+        if len(running) > self.target:
+            if self.drain_started is None:
+                self.drain_started = now
+        else:
+            self.drain_started = None
         reason = 'hill-climb: ' + self.reason
         policy = dict(config, max_running=effective, min_available_memory_mb=0)
         snapshot.update(effective_max_running=effective, concurrency_ceiling=cap,
                         admission_reason=reason, effective_memory_reserve_mb=0, automatic=True,
                         hill_climb=dict(target=self.target, phase=self.phase, reason=self.reason,
-                            objective=self.objective, objective_kind='paired-progress throughput estimate',
+                            objective=self.objective, objective_kind='aggregate phase completion per second',
                             coverage=coverage, measurable_jobs=len(measurements), running_jobs=len(running),
+                            scoring_coverage=scoring_coverage, actual_running=len(running),
+                            draining_jobs=max(0, len(running) - self.target),
+                            draining_seconds=now - self.drain_started if self.drain_started is not None else 0,
+                            holding=self.holding, hold_cause=self.hold_cause, rejected_limit=self.rejected_limit,
+                            turnover_warmup_seconds=(now - self.turnover_started
+                                                     if self.turnover_started is not None else 0),
                             per_job_rates=dict(self.per_job_rates), resource_factor=factor,
                             telemetry_complete=bool(known), probe_headroom=bool(headroom),
                             next_probe_at=self.next_probe_at, window_seconds=self.window_seconds,
                             decisions=list(self.decisions)))
         return policy, snapshot
+
+    def _remember_attempts(self, now, running, measurements):
+        """Bound startup provenance to active attempts, remembering lost counters."""
+        active = {(str(job['id']), str(job.get('attempt_token')), str(job.get('started'))) for job in running}
+        measured = {key[:3] for key in measurements}
+        self.attempt_history = {
+            attempt: dict(first_seen=self.attempt_history.get(attempt, {}).get('first_seen', now),
+                          measured=attempt in measured or self.attempt_history.get(attempt, {}).get('measured', False))
+            for attempt in active}
+
+    def _turnover_warmup(self, now, running, measurements):
+        """Give unmeasured replacements one bounded interval at a learned limit."""
+        if self.probe or self.target <= 1 or not 1 < len(running) <= self.target:
+            return False
+        active = {(str(job['id']), str(job.get('attempt_token')), str(job.get('started'))) for job in running}
+        measured = {key[:3] for key, value in measurements.items()
+                    if value['total'] is not None and value['value'] <= value['total']}
+        missing = active - {key[:3] for key in measurements}
+        established = {attempt for attempt, state in self.attempt_history.items() if state['measured']}
+        if not measured & established or not missing or missing & established:
+            return False
+        if any(now - self.attempt_history.get(attempt, {}).get('first_seen', now)
+               > self.probe_timeout_seconds for attempt in missing):
+            return False
+        if self.turnover_started is None:
+            self.turnover_started = now
+        # Repeated new IDs/retries must not renew a partially observed cohort's
+        # grace. Only a complete productive window clears this episode below.
+        return now - self.turnover_started <= self.probe_timeout_seconds
 
     def _newcomer_warmup(self, running, measurements):
         """Allow a newly admitted command time to emit its first useful counter."""
@@ -257,12 +355,19 @@ class HillClimbingController:
             probe = self.probe
             baseline_keys = probe['baseline']['rates'].keys()
             current = measurements.keys()
-            if now - probe['started'] > self.probe_timeout_seconds:
+            # Waiting for natural completion is actuation latency, not an
+            # observation failure. Timing out here would keep refilling the
+            # very slot that a downward trial is trying to drain.
+            timing_from = probe['observing_at']
+            if timing_from is None and probe['direction'] == 'up':
+                timing_from = probe['started']
+            if timing_from is not None and now - timing_from > self.probe_timeout_seconds:
                 self._abort(now, 'probe timed out; collecting a fresh baseline')
                 return
-            if any(m['value'] < probe['recent'][key]['value'] for key, m in measurements.items()
+            if any(m['value'] < probe['recent'][key]['value']
+                   or m['total'] != probe['recent'][key]['total'] for key, m in measurements.items()
                    if key in probe['recent']):
-                self._abort(now, 'probe counters reset')
+                self._abort(now, 'probe counters reset or totals changed')
                 return
             probe['recent'] = measurements
             if probe['direction'] == 'up':
@@ -286,6 +391,8 @@ class HillClimbingController:
                 self.window = None
                 self.reason = 'waiting for new command progress'
                 return
+            if probe['observing_at'] is None:
+                probe['observing_at'] = now
             if probe['cohort'] is None:
                 probe['cohort'] = set(current)
             elif probe['cohort'] != set(current):
@@ -304,16 +411,21 @@ class HillClimbingController:
             self.window = None
             return
         if len(running) < self.target:
-            # A finished cohort must not carry an old high target into unrelated work.
-            self.target = max(1, len(running))
+            # The worker may not have reaped/refilled a completion at this
+            # sample. Keep the learned admission limit through normal turnover.
             self.window = None
+            self.reason = 'waiting for admitted slots to fill'
+            return
         observation, changed = self._observe(now, measurements, factor)
-        self.phase = 'cooldown' if now < self.next_probe_at else 'baseline'
+        self.phase = 'cooldown' if now < self.next_probe_at else 'hold' if self.holding else 'baseline'
         self.reason = 'probe cooldown; observing progress' if self.phase == 'cooldown' else 'collecting progress baseline'
         if changed:
             self.objective = None
             self.reason = 'cohort or progress phase changed; new baseline'
         if not observation or now < self.next_probe_at:
+            return
+        if not observation['eligible']:
+            self.reason = 'progress is not comparable; observing'
             return
         if not all(rate > 0 for rate in observation['rates'].values()):
             self.reason = 'no useful progress in this window'
@@ -325,16 +437,85 @@ class HillClimbingController:
                 self.next_probe_at = now + self.cooldown_seconds
                 self._decision(now, 'backoff', 'no observed command progress; draining one slot')
             return
+        self.turnover_started = None
+        domains = frozenset((str(job.get('signature') or job.get('command') or job.get('command_kind', 'command')),
+                             str((job.get('progress') or {}).get('phase')),
+                             str((job.get('progress') or {}).get('measurement', {}).get('source')))
+                            for job in running)
+        observation['domains'] = domains
+        if self.holding:
+            released = ((self.hold_cause == 'ceiling' and self.target < cap)
+                        or (self.hold_cause == 'headroom' and headroom))
+            direction = 'up' if released else self._changed_workload(observation, domains)
+            self.phase = 'hold'
+            self.reason = 'holding measured limit; observing for workload changes'
+            if direction is None:
+                return
+            self.holding = False
+            self.hold_cause = None
+            self.rejected_limit = None
+            self.next_direction = direction
+            self._decision(now, 'constraint-change' if released else 'workload-change',
+                           'admission constraint relaxed; reopening search' if released else
+                           'workload or sustained progress changed; reopening search', direction=direction)
         if not queued:
             self.reason = 'queue empty; observing progress'
             return
         direction = self.next_direction
         if direction == 'down' and self.target == 1:
-            direction = 'up'
+            self._hold(observation, domains, 'floor')
+            self.reason = 'holding one slot after downward search'
+            return
         if direction == 'up' and (self.target >= cap or not headroom):
-            if self.target > 1:
-                direction = 'down'
-            else:
-                self.reason = 'at concurrency ceiling' if self.target >= cap else 'limited host headroom'
-                return
+            self._hold(observation, domains, 'ceiling' if self.target >= cap else 'headroom')
+            self.reason = 'at concurrency ceiling' if self.target >= cap else 'limited host headroom'
+            return
         self._begin_probe(now, observation, direction)
+
+    def _hold(self, observation, domains, cause):
+        self.holding = True
+        self.hold_cause = cause
+        self.phase = 'hold'
+        self.reference_rates = dict(observation['normalized_rates'])
+        self.change_work = self.change_expected = self.change_seconds = 0.
+        self.workload = domains
+
+    def _changed_workload(self, observation, domains):
+        """Compare measured work over at least a minute, through ordinary churn."""
+        previous_phases = {key[:3]: key[3:] for key in self.reference_rates}
+        phase_changed = any(key[:3] in previous_phases and previous_phases[key[:3]] != key[3:]
+                            for key in observation['normalized_rates'])
+        if phase_changed or (self.workload is not None and domains != self.workload):
+            # Job IDs aren't workload identity. Different commands/phases are.
+            self.workload = domains
+            self.reference_rates = dict(observation['normalized_rates'])
+            self.change_work = self.change_expected = self.change_seconds = 0.
+            return 'up'
+        self.workload = domains
+        rates = observation['normalized_rates']
+        common = rates.keys() & self.reference_rates.keys()
+        try:
+            expected = math.fsum(self.reference_rates[key] for key in common)
+            actual = math.fsum(rates[key] for key in common)
+        except OverflowError:
+            expected = actual = 0.
+        if expected > 0 and _finite(expected) and _finite(actual):
+            self.change_expected += expected * observation['elapsed']
+            self.change_work += actual * observation['elapsed']
+            self.change_seconds += observation['elapsed']
+            if not all(_finite(value) for value in (self.change_expected, self.change_work, self.change_seconds)):
+                self.change_work = self.change_expected = self.change_seconds = 0.
+        # A replacement gets its own reference; its first counter is not work
+        # and its units are never compared with the command it replaced.
+        self.reference_rates = {key: self.reference_rates.get(key, rate) for key, rate in rates.items()}
+        if self.change_seconds < CHANGE_SECONDS or self.change_expected <= 0:
+            return None
+        ratio = self.change_work / self.change_expected
+        self.change_work = self.change_expected = self.change_seconds = 0.
+        if not _finite(ratio):
+            return None
+        if ratio < 1 - CHANGE_FRACTION:
+            return 'down' if self.target > 1 else 'up'
+        if ratio > 1 + CHANGE_FRACTION:
+            return 'up'
+        return None
