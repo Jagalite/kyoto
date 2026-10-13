@@ -320,7 +320,7 @@ class QueueTest(unittest.TestCase):
 from pathlib import Path
 sys.path.insert(0, sys.argv[2])
 import kyoto, pressure
-pressure.RECOVERY_SECONDS = .3
+pressure.RAMP_SECONDS = .3
 kyoto.SAMPLE_SECONDS = .1
 def sample():
     data = json.loads((Path(sys.argv[1]) / 'host.json').read_text())

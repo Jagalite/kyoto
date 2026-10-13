@@ -39,6 +39,7 @@ kyoto.py logs JOB_ID                        # Read its output
 kyoto.py wait JOB_ID                        # Wait for completion
 kyoto.py cancel JOB_ID                      # Cancel an owned job
 kyoto.py history                            # View completed jobs
+kyoto.py restart                            # Reload worker code, preserving builds
 ```
 
 ## Tests and scheduling
@@ -60,6 +61,22 @@ Use `kyoto.py --help` or `kyoto.py SUBCOMMAND --help` for options.
 Queue state and logs default to `~/.local/state/kyoto`. All participating agents
 should use the same state directory. The database stores full job environments;
 keep it and job logs private and out of Git.
+
+After updating worker code, run `python3 kyoto.py restart`. The coordinator
+accepts a session-specific request between scheduling passes, closes its own
+database/lock handles, and reloads the code. Independent job runners keep their
+processes, attempt IDs, logs, and exit results; queue settings and queued jobs
+remain intact. The command waits for a fresh, recovery-ready replacement session
+before reporting success. Reopen `watch` separately to load dashboard changes.
+
+`restart --timeout 30` bounds the wait. A timeout means replacement readiness
+was not verified, not that builds were stopped. An unconsumed request expires
+and is withdrawn by the caller. Workers older than this restart protocol return
+an explicit unsupported message; they must first be replaced through the
+existing worker lifecycle. The command never falls back to killing processes.
+If the OS denies a build cancellation/deferral signal, the worker keeps tracking
+the job, reports the error in the job and `health.runtime.signal_errors`, and
+retries at ten-second intervals instead of crashing.
 
 The test restriction recognizes Cargo commands and common wrappers; it does not
 inspect arbitrary shell scripts or custom aliases. Do not submit test execution
@@ -106,11 +123,31 @@ not arbitrary shell scripts or code inside build scripts/custom aliases.
 
 ## Automatic deferral
 
+Smart mode prioritizes jobs estimated at **under ten minutes**, using an explicit
+`--estimate` or successful-run history. Generic command-class priors do not justify
+short-job preemption. When a short job cannot fit, Kyoto can stop one retry-eligible
+build estimated at ten minutes or more (or already running that long), provided
+removing it makes room. A running build with 0–120 positive estimated seconds left
+is protected; an overdue estimate means unknown remaining time. No new job starts
+until the stopped attempt has exited. The short job gets priority over aged long
+jobs; the displaced job waits for that short job to finish or leave the queue,
+as well as its retry cooldown. This preference survives coordinator restarts.
+Tests/benchmarks that execute code are never automatically preempted. FIFO mode
+retains FIFO admission. `--auto-defer off` disables automatic preemption.
+
 Kyoto stops and requeues one eligible build at a time when memory pressure is
 warning/critical or swap reads/writes reach 64 KiB/s. It requires six stressed
 seconds within a rolling ten-second window, so repeated bursts count. Occupied
 swap alone is not a trigger. It waits at least ten seconds between stops and
 stops reducing concurrency when pressure eases or only one uncancelled job remains.
+
+New starts resume on the first healthy host sample, with no extra pressure
+recovery cooldown. Automatic mode admits at most one additional job per healthy
+sample (normally every two seconds), above the number already running and within
+the observed-load ceiling. It does not slowly rebuild slots already occupied by
+surviving jobs. Active memory/swap pressure still blocks new starts; sustained
+pressure triggers the deferral system below. Fixed concurrency returns to its
+configured cap as soon as pressure clears.
 
 It favors jobs with more measured RSS and less elapsed work, sends TERM then
 KILL if needed, and waits for the process group to exit before releasing its
@@ -167,3 +204,36 @@ python3 -m unittest discover -s tests -v
 # Include the optional real Cargo smoke test:
 KYOTO_TEST_CARGO=1 python3 -m unittest discover -s tests -v
 ```
+
+### Disk I/O diagnostics
+
+`python3 kyoto.py io --interval 3 --samples 10` emits live JSON samples without
+starting/restarting a worker or changing the queue. It includes physical-device
+read/write MiB/s, IOPS, average operation times in milliseconds, CPU usage,
+memory pressure, running jobs' source/target device mappings, and Cargo progress.
+Target paths come from bounded, offline Cargo metadata; unresolved mappings are
+reported rather than guessed. A lock-wait phase means Cargo's latest recognized
+log event reported a file lock; it is not a kernel-level lock probe.
+
+On macOS, disk counters come from IOKit. Average operation times use deltas of
+[Apple's cumulative nanosecond counters](https://developer.apple.com/documentation/iokit/kioblockstoragedriverstatisticstotalreadtimekey)
+divided by completed operations. `io_time_per_second` sums operation time per wall
+second: concurrent requests can make it exceed one. It is **not** disk busy
+percentage or a measured queue depth. These are whole-device observations, not
+per-job attribution; zero completed operations have unknown average latency.
+Counter resets, device replacement, initial samples, and collection failures do
+not become false zero-latency readings. Other platforms report unavailable.
+
+New workers publish disk metrics in `health` and `watch`; an already-running
+worker retains its loaded code until its next normal restart. The `io` command
+works immediately with existing workers. With pressure control enabled, any
+physical disk with read or write operation times averaging at least 50 ms, at
+least 10 corresponding operations per second, and summed I/O time of at least
+one second per wall second caps admission at one running job. This is a
+conservative host-wide heuristic, not per-job I/O attribution. Sustained disk
+pressure uses the existing six-in-ten-second deferral window and ten seconds
+between stops to reduce eligible builds one at a time, preserving at least one
+uncancelled job. Disk-only deferral favors long builds and protects those expected
+to finish within two minutes. Memory/swap relief may still need to interrupt them.
+Healthy samples restore gradual admission; missing disk telemetry does not invent
+pressure. Use `python3 kyoto.py restart` to activate updated worker code.

@@ -8,11 +8,12 @@ import sys
 import time
 
 from cpu import sample_ticks, utilization
+from disk_io import sample_disks, disk_rates, pressured_disks
 from deferral import SWAP_RATE_MB
 from scheduling import bounded_output
 
 SAMPLE_SECONDS = 2
-RECOVERY_SECONDS = 10
+RAMP_SECONDS = SAMPLE_SECONDS
 
 
 def parse_vm_stat(output):
@@ -46,6 +47,7 @@ def parse_linux(meminfo, vmstat, page_bytes, psi=None):
 
 def sample_host():
     result = {'sampled_at': time.time(), 'sample_monotonic': time.monotonic(), 'cpu_count': os.cpu_count()}
+    result['disk_counters'] = sample_disks()
     try:
         result['cpu_ticks'], result['cpu_idle_indices'] = sample_ticks()
     except (OSError, ValueError, AttributeError, IndexError):
@@ -94,6 +96,11 @@ class AdaptiveController:
         ceiling = config['cpu_budget'] if smart_auto else (1 if auto else config['max_running'])
         aware = config.get('pressure_aware', True)
         snapshot = dict(host)
+        snapshot['disk_io'] = disk_rates(self.previous.get('disk_counters') if self.previous else None,
+                                        host.get('disk_counters', {'valid': False, 'devices': {}}))
+        snapshot.pop('disk_counters', None)
+        snapshot['pressured_disks'] = pressured_disks(snapshot['disk_io'])
+        snapshot['disk_pressure'] = bool(snapshot['pressured_disks'])
         snapshot['swap_in_mb_per_second'] = None
         snapshot['swap_out_mb_per_second'] = None
         valid = bool(host.get('valid'))
@@ -129,6 +136,11 @@ class AdaptiveController:
                                min(ceiling, max(1, len(running) + config['cpu_budget'] - math.ceil(load))))
             if not blocked:
                 reason = 'automatic observed load and pressure'
+        disk_limited = aware and snapshot['disk_pressure']
+        if disk_limited:
+            ceiling = min(ceiling, 1)
+            if not blocked:
+                reason = 'disk pressure: ' + ', '.join(snapshot['pressured_disks']) + '; limiting to one running job'
         if blocked:
             self.limit = 0
             self.last_increase = now
@@ -136,15 +148,16 @@ class AdaptiveController:
             self.limit = min(self.limit, ceiling)
             if self.last_increase is None:
                 self.last_increase = now
-            if not smart_auto and self.limit > 0:
+            if not smart_auto:
                 self.limit = ceiling
-            elif now - self.last_increase >= RECOVERY_SECONDS and (not smart_auto or self.limit == 0 or (queued and len(running) >= self.limit)):
-                self.limit = min(ceiling, self.limit + 1)
+            elif self.limit == 0 or (now - self.last_increase >= RAMP_SECONDS and queued and len(running) >= self.limit):
+                # Resume at the observed running count, not from zero through
+                # slots already occupied. Admit at most one additional job per
+                # healthy sample; sustained-pressure deferral handles overshoot.
+                self.limit = min(ceiling, len(running) + 1)
                 self.last_increase = now
-            if self.limit == 0:
-                reason = 'waiting for pressure recovery cooldown'
-            elif smart_auto and self.limit < ceiling:
-                reason += '; gradual ramp-up'
+            if smart_auto and self.limit < ceiling:
+                reason += '; one additional job per healthy sample'
         # Turning pressure control off explicitly restores a fixed cap immediately.
         if not aware and not smart_auto:
             self.limit = ceiling

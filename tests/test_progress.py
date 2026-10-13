@@ -5,6 +5,14 @@ from progress import parse_progress, job_progress
 
 
 class ProgressTest(unittest.TestCase):
+    def test_lock_wait_clears_old_counts_and_ends_on_progress(self):
+        text = 'Building [==>] 7/10: foo\nBlocking waiting for file lock on build directory\n'
+        p = parse_progress(text)
+        self.assertEqual(p['phase'], 'lock-wait')
+        self.assertIsNone(p['percent'])
+        self.assertEqual(parse_progress(text + 'Compiling bar v1\n')['phase'], 'compiling')
+        self.assertIsNone(parse_progress(text + '[Kyoto: retry starting]\n')['phase'])
+
     def test_cargo_carriage_return_progress(self):
         p = parse_progress('\x1b[32m Building\x1b[0m [====> ] 7/10: example\r Building [======>] 9/10: example\r')
         self.assertEqual((p['phase'], p['completed'], p['percent']), ('compiling', 9, 90))

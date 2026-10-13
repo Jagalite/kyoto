@@ -15,6 +15,8 @@ def parse_progress(text):
         if line == '[Kyoto: retry starting]':
             result = dict(phase=None, completed=None, total=None, percent=None, current=None)
             seen.clear()
+        elif line.startswith('Blocking waiting for file lock'):
+            result.update(phase='lock-wait', completed=None, total=None, percent=None, current=line)
         elif build:
             done, total = map(int, build.group(1, 2))
             result.update(phase='compiling', completed=done, total=total, current=build.group(3).strip(': ') or None)
@@ -70,7 +72,8 @@ def job_progress(root, job, now):
 
 def progress_label(progress):
     phase = progress.get('phase')
-    label = {'compiling': 'Compiling', 'compiled': 'Compilation finished', 'testing': 'Tests (current suite)'}.get(phase, 'Progress unavailable')
+    label = {'compiling': 'Compiling', 'compiled': 'Compilation finished', 'testing': 'Tests (current suite)',
+             'lock-wait': progress.get('current') or 'Waiting for Cargo lock'}.get(phase, 'Progress unavailable')
     if progress.get('percent') is not None:
         label += f" · {progress['completed']}/{progress['total']} · {progress['percent']:g}%"
     seconds = progress.get('remaining_seconds')

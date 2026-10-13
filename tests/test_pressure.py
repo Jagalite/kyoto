@@ -31,15 +31,38 @@ class PressureTest(unittest.TestCase):
         self.assertEqual(snapshot['swap_out_mb_per_second'], 0)
         self.assertEqual(snapshot['swap_used_mb'], 8000)
 
-    def test_swap_activity_blocks_and_recovery_is_gradual(self):
+    def test_swap_activity_blocks_then_resumes_on_first_healthy_sample(self):
         self.update(0)
         policy, snapshot = self.update(2, {'swap_out_mb': 104})
         self.assertEqual(policy['max_running'], 0)
         self.assertEqual(snapshot['admission_reason'], 'active swapping')
         self.assertEqual(snapshot['swap_out_mb_per_second'], 2)
-        self.assertEqual(self.update(4, {'swap_out_mb': 104})[0]['max_running'], 0)
+        self.assertEqual(self.update(4, {'swap_out_mb': 104})[0]['max_running'], 1)
         self.assertEqual(self.update(12, {'swap_out_mb': 104})[0]['max_running'], 1)
         self.assertEqual(self.update(22, {'swap_out_mb': 104}, running=[job('active')])[0]['max_running'], 2)
+
+    def test_recovery_adds_one_slot_above_surviving_jobs(self):
+        running = [job(str(i)) for i in range(4)]
+        self.update(0, {'pressure': 'critical'}, running=running)
+        policy, snapshot = self.update(2, running=running)
+        self.assertEqual(policy['max_running'], 5)
+        self.assertNotIn('cooldown', snapshot['admission_reason'])
+        running.append(job('new'))
+        self.assertEqual(self.update(3, running=running)[0]['max_running'], 5)
+        self.assertEqual(self.update(4, running=running)[0]['max_running'], 6)
+        self.assertEqual(self.update(6, {'pressure': 'warning'}, running=running)[0]['max_running'], 0)
+
+    def test_proactive_recovery_still_obeys_load_ceiling(self):
+        running = [job(str(i)) for i in range(4)]
+        self.update(0, {'pressure': 'warning'}, running=running)
+        policy, _ = self.update(2, {'load_average_1m': 9}, running=running)
+        self.assertEqual(policy['max_running'], 1)
+        self.assertIsNone(choose_job([job('next')], running, policy, 2, 10000)[0])
+
+    def test_fixed_cap_recovers_without_extra_delay(self):
+        self.config['max_running'] = 3
+        self.update(0, {'pressure': 'critical'})
+        self.assertEqual(self.update(2)[0]['max_running'], 3)
 
     def test_pressure_reduces_limit_without_mutating_running_jobs(self):
         running = [job('a'), job('b')]
@@ -78,6 +101,31 @@ class PressureTest(unittest.TestCase):
         policy, snapshot = self.update(0, {'valid': False, 'available_mb': None})
         self.assertEqual(policy['max_running'], 0)
         self.assertIn('unavailable', snapshot['admission_reason'])
+
+    def test_disk_collection_failure_does_not_block_admission(self):
+        policy, snapshot = self.update(0, {'disk_counters': {'valid': False, 'devices': {}, 'error': 'missing'}})
+        self.assertEqual(policy['max_running'], 1)
+        self.assertEqual(snapshot['disk_io']['state'], 'unavailable')
+        self.assertNotIn('disk_counters', snapshot)
+
+    def test_slow_active_disk_caps_concurrency_and_recovers(self):
+        from test_disk_io import counters
+        running = [job(str(i)) for i in range(4)]
+        self.update(0, {'disk_counters': counters(0, 0, 0)}, running=running)
+        policy, snapshot = self.update(2, {'disk_counters': counters(2, 40, 4000000000)}, running=running)
+        self.assertEqual(policy['max_running'], 1)
+        self.assertEqual(snapshot['pressured_disks'], ['disk6'])
+        self.assertIn('disk pressure', snapshot['admission_reason'])
+        self.assertIsNone(choose_job([job('new')], running, policy, 2)[0])
+        policy, snapshot = self.update(4, {'disk_counters': counters(4, 80, 4040000000)}, running=running)
+        self.assertFalse(snapshot['disk_pressure'])
+        self.assertEqual(policy['max_running'], 5)
+
+    def test_disk_cap_also_applies_to_fixed_concurrency(self):
+        from test_disk_io import counters
+        self.config['max_running'] = 3
+        self.update(0, {'disk_counters': counters(0, 0, 0)})
+        self.assertEqual(self.update(2, {'disk_counters': counters(2, 40, 4000000000)})[0]['max_running'], 1)
 
     def test_counter_reset_is_not_negative_activity(self):
         self.update(0)

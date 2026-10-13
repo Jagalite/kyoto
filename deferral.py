@@ -13,6 +13,7 @@ MIN_RSS_MB = 0
 def under_pressure(sample):
     return bool(sample.get('valid') and (
         sample.get('pressure') in ('warning', 'critical') or
+        sample.get('disk_pressure', False) or
         (sample.get('swap_out_mb_per_second') or 0) >= SWAP_RATE_MB or
         (sample.get('swap_in_mb_per_second') or 0) >= SWAP_RATE_MB))
 
@@ -54,8 +55,18 @@ class DeferralController:
                       and (j.get('current_rss_mb') or 0) > MIN_RSS_MB]
         if not candidates:
             return None
-        chosen = max(candidates, key=lambda j: (
-            j['current_rss_mb'] / (1 + max(0, wall_now - j['started']) / 300), j['id']))
+        disk_only = (sample.get('disk_pressure') and sample.get('pressure') not in ('warning', 'critical')
+                     and (sample.get('swap_in_mb_per_second') or 0) < SWAP_RATE_MB
+                     and (sample.get('swap_out_mb_per_second') or 0) < SWAP_RATE_MB)
+        if disk_only:
+            from preemption import finishing_soon
+            candidates = [j for j in candidates if not finishing_soon(j, wall_now)]
+            if not candidates:
+                return None
+            chosen = max(candidates, key=lambda j: (max(j.get('estimate') or 0, wall_now - j['started']), j['id']))
+        else:
+            chosen = max(candidates, key=lambda j: (
+                j['current_rss_mb'] / (1 + max(0, wall_now - j['started']) / 300), j['id']))
         self.next_action = now + RELIEF_SECONDS
         self.samples.clear()
         return chosen

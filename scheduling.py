@@ -35,12 +35,22 @@ def choose_job(queued, running, config, now, available_mb=None):
     limit = config['max_running'] if config['max_running'] != 'auto' else 1
     if not queued or len(running) >= limit:
         return None, 'concurrency limit' if queued else 'queue empty'
-    queued = [j for j in queued if j.get('not_before', 0) <= now]
+    active_ids = {j['id'] for j in queued + running}
+    preferred = {j.get('preempt_for') for j in queued + running} - {None}
+    queued = [j for j in queued if j.get('not_before', 0) <= now
+              and j.get('preempt_for') not in active_ids]
     if not queued:
         return None, 'waiting for deferred job cooldown'
     ordered = sorted(queued, key=lambda j: (j['submitted'], j['id']))
+    from preemption import short_job
     aged = now - ordered[0]['submitted'] >= config['aging_seconds']
-    if config['mode'] == 'fifo' or aged:
+    if config['mode'] == 'smart' and any(j['id'] in preferred for j in queued):
+        candidates = sorted((j for j in queued if j['id'] in preferred), key=lambda j: (j['estimate'], j['submitted'], j['id']))
+        reason = 'short job granted preemption'
+    elif config['mode'] == 'smart' and any(short_job(j) for j in queued):
+        candidates = sorted((j for j in queued if short_job(j)), key=lambda j: (j['estimate'], j['submitted'], j['id']))
+        reason = 'shortest estimated job (under ten minutes)'
+    elif config['mode'] == 'fifo' or aged:
         candidates = ordered[:1]
         reason = 'FIFO' if config['mode'] == 'fifo' else 'aging priority'
     else:

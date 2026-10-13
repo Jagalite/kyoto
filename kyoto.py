@@ -21,12 +21,14 @@ from commands import PRIORS
 from command_policy import initialize as initialize_policy, preset as policy_preset, read_policy, validate_policy, parameter as policy_parameter
 from progress import job_progress
 from deferral import DeferralController, COOLDOWN_SECONDS, RELIEF_SECONDS
+from preemption import choose_preemption
 from pressure import AdaptiveController, SAMPLE_SECONDS, sample_host
 
 from scheduling import (DEFAULT_CONFIG, choose_job, discover_resources, forecast,
                         positive, sample_groups, execution_plan)
 
 JOB_COLUMNS = {
+    'preempt_for': 'TEXT',
     'attempt_token': 'TEXT',
     'allow_retry': 'INTEGER NOT NULL DEFAULT 0',
     'deferral_count': 'INTEGER NOT NULL DEFAULT 0',
@@ -76,6 +78,14 @@ def connect(root, *, preview=False):
             db.execute(f'ALTER TABLE jobs ADD COLUMN {name} {declaration}')
     db.execute('CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
     db.execute('CREATE TABLE IF NOT EXISTS runtime (id INTEGER PRIMARY KEY, value TEXT NOT NULL)')
+    db.execute('CREATE TABLE IF NOT EXISTS worker_restart (request_id TEXT PRIMARY KEY, session TEXT NOT NULL, expires REAL NOT NULL)')
+    if 'request_id' not in {r[1] for r in db.execute('PRAGMA table_info(worker_restart)')}:
+        # Early workers keyed requests by session. Preserve pending requests
+        # while allowing independent callers to withdraw only their own request.
+        db.execute('ALTER TABLE worker_restart RENAME TO worker_restart_legacy')
+        db.execute('CREATE TABLE worker_restart (request_id TEXT PRIMARY KEY, session TEXT NOT NULL, expires REAL NOT NULL)')
+        db.execute('INSERT INTO worker_restart SELECT lower(hex(randomblob(16))),session,expires FROM worker_restart_legacy')
+        db.execute('DROP TABLE worker_restart_legacy')
     # Remove old inferred admission locks; retain only caller-requested locks.
     db.execute("UPDATE jobs SET resources='[]', resource_source='command manages its own locks' WHERE status IN ('queued','running') AND resource_source != 'explicit resource paths' AND resources != '[]'")
     db.execute('CREATE INDEX IF NOT EXISTS jobs_owner ON jobs(owner_id, submitted)')
@@ -151,16 +161,21 @@ def group_alive(pgid):
         return True
 
 
-def begin_deferral(db, job_id, now):
+def begin_deferral(db, job_id, now, reason='sustained memory/swap pressure', preempt_for=None):
     db.execute('BEGIN IMMEDIATE')
     try:
         row = db.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone()
         if row is None or row['cancel'] or row['status'] != 'running' or row['deferring']:
             db.rollback()
             return False
-        db.execute('UPDATE jobs SET deferring=1, deferral_count=deferral_count+1 WHERE id=?', (job_id,))
+        if preempt_for is not None:
+            target = db.execute("SELECT 1 FROM jobs WHERE id=? AND status='queued' AND cancel=0 AND not_before<=?", (preempt_for, now)).fetchone()
+            if not target or config_for(db).get('paused'):
+                db.rollback()
+                return False
+        db.execute('UPDATE jobs SET deferring=1, deferral_count=deferral_count+1, preempt_for=? WHERE id=?', (preempt_for, job_id))
         db.execute('INSERT INTO deferred_attempts(job_id,started,requested,reason) VALUES (?,?,?,?)',
-                   (job_id, row['started'], now, 'sustained memory/swap pressure'))
+                   (job_id, row['started'], now, reason))
         db.commit()
         return True
     except Exception:
@@ -185,12 +200,34 @@ def complete_deferral(db, job_id, code, usage, finished_at=None):
                 deferring=0,not_before=?,current_rss_mb=0,peak_rss_mb=NULL,rss_samples=0,
                 cpu_seconds=NULL,user_cpu_seconds=NULL,system_cpu_seconds=NULL,wait_max_rss_mb=NULL,
                 io_input_blocks=NULL,io_output_blocks=NULL,error=NULL,
-                scheduling_reason='deferred for pressure; waiting for recovery' WHERE id=?""",
+                scheduling_reason='deferred; waiting for retry eligibility' WHERE id=?""",
                 (now + COOLDOWN_SECONDS, job_id))
         db.commit()
     except Exception:
         db.rollback()
         raise
+
+
+def signal_attempt(db, job_id, state, sig):
+    """Keep tracking a build if the OS refuses a cancellation/deferral signal."""
+    now = time.monotonic()
+    if now < state.get('next_signal_at', 0):
+        return
+    try:
+        state['process'].signal(sig)
+    except PermissionError as exc:
+        message = f'Cannot signal running job: {exc}; retrying in 10 seconds'
+        if state.get('signal_error') != message:
+            print(f'{job_id}: {message}', file=sys.stderr, flush=True)
+        state['signal_error'] = message
+        state['next_signal_at'] = now + 10
+        db.execute('UPDATE jobs SET error=? WHERE id=?', (message, job_id))
+        db.commit()
+    else:
+        if state.pop('signal_error', None):
+            db.execute('UPDATE jobs SET error=NULL WHERE id=?', (job_id,))
+            db.commit()
+        state.pop('next_signal_at', None)
 
 
 def worker(root):
@@ -227,6 +264,7 @@ def worker(root):
         last_config = None
         controller = AdaptiveController()
         deferrer = DeferralController()
+        next_preemption = 0
         last_deferral = db.execute('SELECT MAX(requested) FROM deferred_attempts').fetchone()[0]
         if last_deferral is not None:
             deferrer.next_action = time.monotonic() + max(0, last_deferral + RELIEF_SECONDS - time.time())
@@ -235,6 +273,20 @@ def worker(root):
         recovery_ready = False
         while True:
             now = time.time()
+            # Handoff only between iterations, with no launch transaction open.
+            # Durable runners retain ownership of commands and their results.
+            request = db.execute('SELECT 1 FROM worker_restart WHERE session=? AND expires>=?', (worker_session, now)).fetchone()
+            if request:
+                pressure_snapshot.update(recovery_ready=False, restarting=True)
+                db.execute('UPDATE runtime SET value=? WHERE id=1', (json.dumps(pressure_snapshot),))
+                db.execute('DELETE FROM worker_restart WHERE session=?', (worker_session,))
+                db.commit()
+                db.close()
+                if legacy_lock is not None:
+                    legacy_lock.close()
+                print(f'Graceful restart: handing off worker session {worker_session}; {len(active)} active jobs preserved',
+                      file=sys.stderr, flush=True)
+                return True
             host_sampled = False
             if legacy_lock is None and now - last_legacy_check >= 2:
                 legacy_lock = recovery.claim_legacy_lock(root)
@@ -264,6 +316,9 @@ def worker(root):
                 pressure_snapshot['supports_auto_defer'] = True
                 pressure_snapshot['supports_command_policy'] = True
                 pressure_snapshot['supports_recovery'] = True
+                pressure_snapshot['supports_restart'] = True
+                pressure_snapshot['signal_errors'] = {job_id: state['signal_error'] for job_id, state in active.items()
+                                                      if state.get('signal_error')}
                 pressure_snapshot['recovery_ready'] = recovery_ready
                 db.execute('INSERT INTO runtime (id,value) VALUES (1,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value',
                            (json.dumps(pressure_snapshot),))
@@ -294,20 +349,31 @@ def worker(root):
                     del active[job_id]
                     continue
                 if state['cancelled'] or state.get('deferring'):
-                    process.signal(signal.SIGKILL if time.monotonic() >= state['deadline'] else signal.SIGTERM)
+                    signal_attempt(db, job_id, state, signal.SIGKILL if time.monotonic() >= state['deadline'] else signal.SIGTERM)
             if host_sampled and not any(s.get('deferring') for s in active.values()):
                 running = [job_dict(r) for r in db.execute("SELECT * FROM jobs WHERE status='running'")]
+                eligible = {j['id'] for j in running if j['id'] in active and isinstance(active[j['id']]['process'], recovery.Attempt)
+                            and active[j['id']]['process'].pid and rss_fresh and time.time() - last_sample < 3}
                 candidate = deferrer.choose(config, pressure_snapshot, running, time.monotonic(), now,
-                    eligible_ids={j['id'] for j in running if j['id'] in active and isinstance(active[j['id']]['process'], recovery.Attempt)
-                                  and active[j['id']]['process'].pid and rss_fresh and time.time() - last_sample < 3})
-                if candidate and begin_deferral(db, candidate['id'], now):
+                    eligible_ids=eligible)
+                reason = 'sustained memory/swap/disk pressure' if pressure_snapshot.get('disk_pressure') else 'sustained memory/swap pressure'
+                preempt_for = None
+                if candidate is None and time.monotonic() >= next_preemption:
+                    queued = [job_dict(r) for r in db.execute("SELECT * FROM jobs WHERE status='queued' AND cancel=0")]
+                    decision = choose_preemption(config, policy, queued, running, now, eligible)
+                    if decision:
+                        candidate, waiting = decision
+                        preempt_for = waiting['id']
+                        reason = 'yielding to short job ' + preempt_for
+                if candidate and begin_deferral(db, candidate['id'], now, reason, preempt_for):
+                    next_preemption = time.monotonic() + RELIEF_SECONDS
                     state = active[candidate['id']]
                     state['deferring'] = True
                     state['deadline'] = time.monotonic() + 3
                     with open(root / (candidate['id'] + '.log'), 'ab') as log:
-                        log.write(b'\n[Kyoto: stopping for sustained memory/swap pressure; will retry]\n')
-                    state['process'].signal(signal.SIGTERM)
-            while not config['paused']:
+                        log.write(('\n[Kyoto: stopping for ' + reason + '; will retry]\n').encode())
+                    signal_attempt(db, candidate['id'], state, signal.SIGTERM)
+            while not config['paused'] and not any(s.get('deferring') for s in active.values()):
                 queued = [job_dict(r) for r in db.execute("SELECT * FROM jobs WHERE status='queued' AND cancel=0")]
                 running = [job_dict(r) for r in db.execute("SELECT * FROM jobs WHERE status='running'")]
                 for job in running:
@@ -331,7 +397,7 @@ def worker(root):
                 attempt_path.mkdir(parents=True, mode=0o700)
                 with (attempt_path / 'lock').open('a') as attempt_lock:
                     fcntl.flock(attempt_lock, fcntl.LOCK_EX)
-                    cursor = db.execute("UPDATE jobs SET status='running', started=?, scheduling_reason=?, attempt_token=? WHERE id=? AND status='queued' AND cancel=0",
+                    cursor = db.execute("UPDATE jobs SET status='running', started=?, scheduling_reason=?, attempt_token=?, preempt_for=NULL WHERE id=? AND status='queued' AND cancel=0",
                                         (time.time(), reason, token, row['id']))
                     db.commit()
                     if not cursor.rowcount:
@@ -633,8 +699,8 @@ def main():
     configure = commands.add_parser('config', help='Show or update shared live scheduling policy')
     configure.add_argument('--mode', choices=['fifo', 'smart'])
     configure.add_argument('--max-running', type=concurrency_limit, help='Positive integer or auto')
-    configure.add_argument('--pressure-aware', choices=['on', 'off'], help='Gate new starts on swap and host memory pressure')
-    configure.add_argument('--auto-defer', choices=['on', 'off'], help='Stop and requeue eligible builds under sustained severe pressure (default on)')
+    configure.add_argument('--pressure-aware', choices=['on', 'off'], help='Gate new starts on memory, swap, and disk pressure')
+    configure.add_argument('--auto-defer', choices=['on', 'off'], help='Stop and requeue eligible builds for sustained pressure or short-job priority (default on)')
     configure.add_argument('--cpu-budget', type=positive_int)
     configure.add_argument('--memory-budget-mb', type=nonnegative_float, help='Deprecated compatibility option; no admission effect')
     configure.add_argument('--aging-seconds', type=positive_float)
@@ -648,8 +714,13 @@ def main():
     dashboard.add_argument('--history', type=positive_int, default=None, help='Initially load this many completed jobs; default: all history')
     commands.add_parser('status')
     commands.add_parser('health', help='Show latest host pressure and effective concurrency')
+    io = commands.add_parser('io', help='Read-only live disk diagnostic; does not restart workers')
+    io.add_argument('--interval', type=positive_float, default=2)
+    io.add_argument('--samples', type=positive_int, default=5)
     commands.add_parser('_worker')
     commands.add_parser('start')
+    restart = commands.add_parser('restart', help='Gracefully reload the worker, preserving running builds')
+    restart.add_argument('--timeout', type=positive_float, default=30, help='Seconds to wait for a ready replacement worker')
     history = commands.add_parser('history')
     history.add_argument('--limit', type=positive_int, default=20)
     jobs = commands.add_parser('jobs', help='List jobs across projects, optionally filtered by owner')
@@ -665,6 +736,16 @@ def main():
             p.add_argument('--force', action='store_true', help='Explicitly bypass ownership, including legacy ownerless jobs')
     args = parser.parse_args()
     root = Path(args.state).expanduser().resolve()
+    if args.action == 'io':
+        from disk_io import diagnose
+        return diagnose(root, args.interval, args.samples)
+    if args.action == 'restart':
+        from worker_restart import restart_worker
+        try:
+            print(json.dumps(restart_worker(root, args.timeout)))
+            return 0
+        except (RuntimeError, TimeoutError) as exc:
+            parser.exit(3, str(exc) + '\n')
     if args.action not in ('_worker', 'submit', 'config', 'cancel', 'policy', 'watch', 'tui', 'wait'):
         if recover_existing(root) is False:
             parser.exit(3, 'Worker recovery incomplete; saved job states are not verified. Retry shortly or inspect worker.log.\n')
@@ -681,7 +762,9 @@ def main():
     db = connect(root)
     if args.action == '_worker':
         db.close()
-        worker(root)
+        if worker(root):
+            # Reload modules from disk after releasing coordinator-only handles.
+            os.execv(sys.executable, [sys.executable, str(Path(__file__).resolve()), '--state', str(root), '_worker'])
         return 0
     if args.action == 'policy':
         if args.policy_action != 'show':

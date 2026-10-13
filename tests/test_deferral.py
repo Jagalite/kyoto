@@ -15,6 +15,15 @@ from scheduling import DEFAULT_CONFIG, choose_job, forecast
 
 
 class DeferralTest(unittest.TestCase):
+    def test_sustained_disk_pressure_reduces_concurrency_but_keeps_one(self):
+        controller = DeferralController()
+        sample = dict(valid=True, pressure='normal', disk_pressure=True)
+        jobs = [self.job(), self.job(id='b')]
+        for t in (0, 2, 4):
+            self.assertIsNone(controller.choose(DEFAULT_CONFIG, sample, jobs, t, t))
+        self.assertIsNotNone(controller.choose(DEFAULT_CONFIG, sample, jobs, 6, 6))
+        self.assertIsNone(controller.choose(DEFAULT_CONFIG, sample, jobs[:1], 20, 20))
+
     def job(self, **extra):
         return dict(dict(id='a', command_kind='build', status='running', started=0,
                          current_rss_mb=512, deferral_count=0, cancel=0), **extra)
@@ -140,7 +149,7 @@ class DeferralTest(unittest.TestCase):
             driver = '''import time, kyoto, pressure, deferral
 from pathlib import Path
 kyoto.SAMPLE_SECONDS=.1
-pressure.RECOVERY_SECONDS=.1
+pressure.RAMP_SECONDS=.1
 deferral.SUSTAIN_SECONDS=.2
 deferral.COOLDOWN_SECONDS=.3
 deferral.MIN_RSS_MB=0

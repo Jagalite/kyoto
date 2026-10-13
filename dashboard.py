@@ -15,6 +15,7 @@ import unicodedata
 from commands import classify
 from deferral import SWAP_RATE_MB
 from progress import job_progress, progress_label
+from disk_io import disk_lines
 from scheduling import DEFAULT_CONFIG, choose_job, execution_plan
 from target_sizes import TargetSizes
 
@@ -63,6 +64,8 @@ def read_snapshot(root, history=None):
                    'cpu_slots, memory_mb, current_rss_mb, peak_rss_mb, cpu_seconds, cancel, error, resources')
         existing = {r[1] for r in db.execute('PRAGMA table_info(jobs)')}
         columns += ', owner_id' if 'owner_id' in existing else ', NULL AS owner_id'
+        for name in ('preempt_for', 'estimate_basis'):
+            columns += ', ' + name if name in existing else ', NULL AS ' + name
         for name in ('deferral_count', 'deferring', 'not_before'):
             columns += ', ' + name if name in existing else ', 0 AS ' + name
         active = [dict(r) for r in db.execute('SELECT ' + columns + " FROM jobs WHERE status IN ('queued','running') ORDER BY CASE status WHEN 'running' THEN 0 ELSE 1 END, submitted, id")]
@@ -140,6 +143,8 @@ def scheduling_summary(snapshot):
     if 'OS memory pressure:' in reason:
         return 'Waiting for memory pressure to ease'
     if 'concurrency limit' in reason:
+        if (snapshot.get('runtime') or {}).get('disk_pressure'):
+            return 'Disk pressure · limiting concurrency to one job'
         return 'Waiting for a running job to finish'
     if 'resource locks' in reason or 'workspace/target paths' in reason:
         return 'Waiting for a resource lock'
@@ -166,6 +171,7 @@ def headers(snapshot):
         f"KYOTO  {config['mode']} / {config['max_running']}  |  {running} running, {queued} queued  |  limit {effective}  |  {datetime.datetime.fromtimestamp(snapshot['now']).strftime('%H:%M:%S')}",
         f"Memory available {memory(runtime.get('available_mb'))}  |  pressure {runtime.get('pressure', '-')} ({sample})",
         cpu_summary(runtime) + '  ·  ' + memory_summary(runtime) + '  ·  ' + swap_summary(runtime),
+        *disk_lines(runtime.get('disk_io')),
         scheduling_summary(snapshot),
     ]
 
@@ -314,12 +320,20 @@ def draw_dashboard(screen, snapshot, root, selected, logs, styles, error=None):
             'muted' if snapshot['fresh'] else 'warn')
     if width >= 100:
         put(4, 64, swap_summary(host), 'warn' if snapshot['fresh'] and ((host.get('swap_in_mb_per_second') or 0) >= SWAP_RATE_MB or (host.get('swap_out_mb_per_second') or 0) >= SWAP_RATE_MB) else 'info')
-    put(5, 2, short(error or scheduling_summary(snapshot), width - 4), 'bad' if error else 'muted')
-    put(6, 2, '─' * (width - 4), 'muted')
+    disks = disk_lines(host.get('disk_io'))
+    disk_budget = max(2, height - 13)
+    if len(disks) > disk_budget:
+        omitted = len(disks) - disk_budget + 1
+        disks = disks[:disk_budget - 1] + [f'… {omitted} more disks (watch --once shows all)']
+    for index, line in enumerate(disks):
+        put(5 + index, 2, line, 'muted' if index == 0 or not snapshot['fresh'] else 'info')
+    put(5 + len(disks), 2, short(error or scheduling_summary(snapshot), width - 4), 'bad' if error else 'muted')
+    list_top = 7 + len(disks)
 
     wide = width >= 110
+    show_details = wide or height - list_top >= 12
     split = width - max(40, min(54, width // 3)) if wide else width
-    list_end = height - 3 if wide else height - 10
+    list_end = height - 3 if wide or not show_details else height - 10
     list_width = split - 4
     # Section headers and two-line jobs create a scrollable, coherent list.
     entries = []
@@ -335,10 +349,10 @@ def draw_dashboard(screen, snapshot, root, selected, logs, styles, error=None):
             previous_group = group
         positions[index] = len(entries)
         entries.extend([('job', job, index), ('command', job, index)])
-    visible = max(3, list_end - 7)
+    visible = max(1, list_end - list_top)
     offset = max(0, positions.get(selected, 0) + 2 - visible)
     for line, (kind, value, index) in enumerate(entries[offset:offset + visible]):
-        row = 7 + line
+        row = list_top + line
         if kind == 'spacer':
             continue
         if kind == 'section':
@@ -371,16 +385,16 @@ def draw_dashboard(screen, snapshot, root, selected, logs, styles, error=None):
         else:
             put(row, 4, short(shlex.join(value['command']), list_width - 3), 'muted', list_width - 2, bold=focused)
     if not jobs:
-        put(8, 3, 'Nothing in the queue.', 'muted')
-        put(10, 3, 'Submit a build from another terminal.', 'muted', list_width)
+        put(list_top, 3, 'Nothing in the queue.', 'muted')
+        put(list_top + 1, 3, 'Submit a build from another terminal.', 'muted', list_width)
     if wide:
-        for row in range(7, height - 3):
+        for row in range(list_top, height - 3):
             put(row, split - 1, '│', 'muted')
-        x, top, panel_width = split + 2, 7, width - split - 5
-    else:
+        x, top, panel_width = split + 2, list_top, width - split - 5
+    elif show_details:
         put(list_end, 2, '─' * (width - 4), 'muted')
         x, top, panel_width = 2, list_end + 1, width - 4
-    if jobs:
+    if jobs and show_details:
         job = jobs[selected]
         put(top, x, 'LOG TAIL' if logs else 'JOB DETAILS', 'accent')
         identity = job['id'][:8] if wide else job['id']
