@@ -1,5 +1,8 @@
 # Hill-climbing convergence experiments
 
+For the newer 34-scenario comparison of all twelve policies, see
+[Comparing all scheduling policies](#comparing-all-scheduling-policies).
+
 The revised controller corrects the objective counterexamples and greatly
 improves the finite-workload models below. This is bounded model evidence,
 not proof of general convergence or a hardware benchmark. Smart mode remains
@@ -138,3 +141,180 @@ Future work needs workload-specific phase weights or better comparable work
 estimates, stronger treatment of quantized observations, and an explicit answer
 to the cost of exploratory slots that cannot be removed. Any change to process
 suspension or retries must account for retained RAM/locks and repeated work.
+
+## Comparing all scheduling policies
+
+`experiments/scheduler_comparison.py` compares twelve policies without launching
+commands or touching queue state: FIFO auto (one slot), FIFO with eight slots,
+smart auto, smart auto with retries disabled, original hill climbing (`e3f51af`),
+improved hill climbing, and smart mode capped at 1, 2, 3, 4, 6, or 8 slots.
+The fixed smart policies retain smart ordering, pressure gates, and retry rules;
+they are actual configurations, not a perfect scheduler with future knowledge.
+The old hill controller is injected into the same current pressure wrapper.
+
+The suite calls the production `AdaptiveController`, `choose_job`,
+`DeferralController`, and `choose_preemption`. It integrates CPU ticks, swap,
+and disk counters and passes them through the real telemetry-rate calculations.
+RSS, host load, work service, and process termination are synthetic. Default
+estimates equal each job's solo work size and are held constant; history estimation
+is not retrained during the run. Pressure
+and short-job retries wait one simulated second for termination, block new
+admissions during that interval, observe the real sixty-second retry cooldown,
+and preserve the real reservation for a preemption beneficiary. The model
+charges discarded work against useful throughput. No real process is signalled.
+
+```sh
+python3 experiments/scheduler_comparison.py --seeds 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20 --output /tmp/kyoto-policy-matrix.json
+python3 experiments/scheduler_sensitivity.py --output /tmp/kyoto-policy-sensitivity.json
+python3 -m unittest discover -s tests -p test_scheduler_comparison.py -v
+# Optional; requires matplotlib in the selected Python environment:
+python3 experiments/plot_scheduler_comparison.py /tmp/kyoto-policy-matrix.json --output-dir /tmp/kyoto-policy-plots
+```
+
+The 34 scenarios cover linear scaling, saturation, serial bottlenecks, flat and
+nonconvex throughput curves, long/mixed jobs, noisy/coarse/missing progress,
+unknown totals, delayed/buffered output, phase changes, worsening/improving/
+periodic bottlenecks, outside CPU load, internally parallel commands, RAM and
+disk overload, swap bursts, missing telemetry, explicit/global locks, inaccurate
+estimates, short-job arrivals, aging, retry retention, and commands unsafe to retry.
+Each runs for 1,200 simulated seconds, with 2-second host sampling and a 0.5-second
+worker integration step. The main matrix uses twenty seeds and identical job and
+noise streams for all policies: **8,160 policy runs**.
+
+Most scenarios submit eighty jobs immediately; arrival cases start twelve long
+jobs and subsequently submit short jobs. Work units are comparable within this
+model. Available memory is 14,000 MiB before job RSS, total memory 16,000 MiB, and
+the CPU budget eight. Ordinary jobs demand half a modeled core and 500 MiB RSS;
+explicit overload scenarios change these assumptions. Physical service follows
+the named throughput curve, with additional modeled slowdown under RAM/disk/CPU
+contention. Healthy synthetic disk counters include background operations so
+telemetry can be complete while the queue is idle.
+
+Metrics remain separate:
+
+- **Useful work:** completed plus retained partial work, excluding discarded retry
+  work. Raw physical work equals useful work plus discarded work; every run checks
+  this conservation identity and checks explicit lock/cap constraints.
+- **Normalized jobs:** the sum of each job's completed fraction. This is different
+  from raw work, and also different from the hill objective when jobs have phases.
+- **Completion latency:** restricted mean time from submission to completion,
+  counting unfinished jobs up to the horizon. Completed-only latency is also
+  recorded but is not used to rank policies, because excluding unfinished jobs
+  would reward starvation. Short/long cohorts have separate latency and completion
+  fractions. Wait percentiles refer to first admission; retries remain included
+  in completion latency.
+- **Other costs:** completions, unstarted/unfinished jobs, oldest unfinished age,
+  pressure exposure, preemptions, pressure retries, discarded work, and time actual
+  concurrency exceeds the admission target.
+
+The aggregate score divides each policy's useful work by the best tested result
+for the same scenario/seed, then averages with equal weight per scenario. The
+latency score similarly compares restricted mean flow time, with higher better.
+Neither score establishes a universal optimum or represents a production traffic
+mix. Numerous scenarios intentionally stress a three-slot bottleneck, so a fixed
+three-slot configuration has a substantial hindsight advantage in this suite.
+Use the per-scenario results and both objectives when interpreting the ranking.
+
+The sensitivity script adds **576 executions**: paired 0.5/0.1-second integration
+runs, retry retention of 0%, 50%, 80%, and 100%, and a cross-product of five capacity
+curves with complete/missing/unknown-total/coarse counters. These checks use three
+seeds and four policies. Retention means the fraction of accumulated work retained
+at each retry; actual cache effectiveness and termination delay remain unmeasured.
+
+### Results of the broader comparison
+
+All 8,160 main runs completed. A further 720 runs repeated sparse counters, a
+worsening bottleneck, and phase changes at the real worker's 0.1-second cadence.
+Together with 576 sensitivity executions, the preserved comparison contains
+**9,456 policy executions**. Ten model/decision checks and the nine existing
+closed-loop regression tests passed. Scheduling implementations were unchanged.
+
+Aggregate scores below average the per-case percentage of the best tested
+policy; higher is better. They reflect this deliberately adversarial workload
+selection. The fixed-three policy particularly benefits from the many variants
+of a known three-slot bottleneck. These are not hardware efficiency percentages.
+
+| Policy | Useful work score | Job progress score | Completion latency score |
+| --- | ---: | ---: | ---: |
+| smart-fixed-3 | 93.8% | 94.6% | 97.9% |
+| hill-current | 82.1% | 64.8% | 88.0% |
+| smart-fixed-2 | 77.1% | 79.9% | 93.6% |
+| hill-original | 76.8% | 61.6% | 87.0% |
+| smart-fixed-4 | 67.5% | 70.5% | 90.4% |
+| fifo-auto | 51.5% | 36.0% | 82.1% |
+| smart-fixed-1 | 51.4% | 54.9% | 87.4% |
+| smart-fixed-6 | 41.6% | 44.5% | 84.9% |
+| smart-no-defer | 36.9% | 34.7% | 81.3% |
+| fifo-8 | 36.9% | 26.7% | 80.4% |
+| smart-auto | 29.1% | 30.2% | 83.2% |
+| smart-fixed-8 | 27.0% | 28.0% | 82.9% |
+
+There is no single winner across the scenarios or objectives:
+
+- **Scalable work:** smart auto achieves about 9,406 useful units versus 8,303
+  for improved hill climbing. Exploration and observation impose a ramp-up cost.
+- **Hidden contention:** improved hill climbing achieves about 2,820 useful
+  units, close to fixed-three at 2,874. Smart auto grows to eight with healthy
+  host telemetry, then retries overdue jobs; the cold-retry model retains only
+  282 units. Disabling retries raises that to 612, so oversubscription and retry
+  loss are separate problems. This deliberately hidden contention model is not
+  a claim about typical Cargo performance.
+- **Nonconvex throughput:** smart auto crosses a low-throughput region and
+  reaches about 5,131 units. Improved hill climbing stops near a local maximum
+  at 1,870. One-slot local search cannot promise the global optimum.
+- **Capacity returning:** improved hill climbing retains its one-slot decision
+  when solo speed does not change, although parallelism becomes useful again.
+  It achieves 1,164 units versus the original controller's 1,629 (29% less).
+- **Phase changes:** at the finer 0.1-second cadence, the improved controller
+  achieves 2,238 units versus the original controller's 2,557 (12.4% less).
+  Frequent phase changes reopen exploration and interfere with stable learning.
+- **Unknown progress:** when the capacity curve scales linearly, missing counters
+  reduce hill climbing to about 1,197 units while smart auto reaches 9,314 in the
+  sensitivity grid. Conservative fallback has a real opportunity cost. The
+  original controller can also outperform the improved one on unknown totals
+  in this common-unit model; its arbitrary-command scoring remains invalid, as
+  established by the objective counterexamples above.
+- **Short-job latency versus work:** in the cold-retry arrival case, improved
+  hill climbing retains 2,820 work units and completes 13 jobs; fixed-three smart
+  retains 2,326 units and completes 115. Restricted mean short-job latency is
+  496 versus 26 seconds. Hill climbing finishes two long jobs; smart finishes
+  none. Neither metric alone captures the desired fairness policy.
+- **Aging:** an independent call to production `choose_job` selects a newly
+  queued ten-second job over a 900-second job already waiting 601 seconds,
+  despite a 300-second aging threshold. Smart short-job priority precedes its
+  aging branch. This is an ordering issue, separate from concurrency search.
+
+#### Sensitivity and limits
+
+The three-seed step-size check changed individual sparse-progress work results
+by up to 10.0% and worsening-bottleneck results by up to 7.1%. One of eighteen
+scenario/seed winners among the four checked policies changed. The subsequent
+full twenty-seed, twelve-policy, 0.1-second rerun retained the scenario-mean
+useful-work winners for all three refined scenarios. Near-ties and individual
+trajectories therefore remain sensitive even when the mean conclusion survives.
+
+Retry retention materially affects the cost of preemption. In the short-arrival
+case, fixed-three smart improves from 2,326 useful units with cold retries to
+2,880 with complete retention. Real build cache retention must be measured before
+using these numbers to predict deployment performance. Disk-thrash sensitivity
+results are shown separately below (three-seed means).
+
+| Policy | 0% retained | 50% retained | 80% retained | 100% retained |
+| --- | ---: | ---: | ---: | ---: |
+| smart-auto | 23 | 119 | 326 | 694 |
+| smart-no-defer | 596 | 596 | 596 | 596 |
+| hill-current | 1,924 | 2,114 | 2,147 | 2,248 |
+| smart-fixed-3 | 2,875 | 2,875 | 2,875 | 2,875 |
+
+The results support three next changes: make retry decisions account for
+discarded work, re-explore carefully when capacity may have recovered, and choose
+an explicit balance between command completion latency, long-job fairness, and
+aggregate progress. A hybrid needs to be run through this same suite before it
+can be called an improvement. The benchmark does not cover native process-signal
+failures, worker restarts, adaptive history training, or actual hardware service
+curves; existing integration tests cover lifecycle behavior separately.
+
+The raw reports, source hashes, and three heatmaps are preserved in
+`/private/tmp/kyoto-policy-comparison-osw84ofa/`. `matrix.json` is the main sweep,
+`fine-matrix.json` is the 0.1-second follow-up, `sensitivity.json` records the
+assumption checks, and `plots/` compares work, job progress, and latency.
