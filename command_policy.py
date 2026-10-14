@@ -161,4 +161,14 @@ def prepare_submission(command, db):
                    'this job compiles only (--no-run). Tests/benchmarks will not run.')
     else:
         command = requested
-    return command, validate_policy(command, db), message
+    info = validate_policy(command, db)
+    if info['kind'] == 'test-compile':
+        argv = cargo_args(command)
+        split = argv.index('--') if '--' in argv else len(argv)
+        extra = {r['parameter'] for r in policy['rules']
+                 if r['value'] is not None or r['max_value'] is not None}
+        _, options = arguments(argv[:split], VALUES | extra, True)
+        if 'doc' in options:
+            raise ValueError('Cargo cannot compile documentation tests without running them. '
+                             'Test execution must be allowed to submit cargo test --doc.')
+    return command, info, message

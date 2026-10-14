@@ -80,12 +80,3 @@ def classify(command):
             'fmt': 'format', 'metadata': 'metadata', 'locate-project': 'metadata',
             'fetch': 'fetch', 'doc': 'doc', 'rustdoc': 'doc'}.get(subcommand, 'opaque')
     return dict(kind=kind, executes_tests=False)
-
-
-def validate(command):
-    info = classify(command)
-    if info['executes_tests']:
-        subcommand = 'bench' if info['kind'] == 'bench-run' else 'test'
-        raise ValueError(f'cargo {subcommand} execution is not supported in Kyoto. '
-                         f'Compile with cargo {subcommand} --no-run, then run tests/benchmarks outside Kyoto.')
-    return info

@@ -212,6 +212,9 @@ JSON responses include `requested_command`, the effective `command`, and a
 `policy_message` explaining automatic compilation-only behavior. The message
 persists in `show`, `wait`, and history results, including after completion.
 Existing queued commands are still rechecked, not rewritten, after policy changes.
+Documentation-only tests (`cargo test --doc`) require execution permission: Cargo
+cannot compile them separately without running them, so compile-only submissions
+are rejected with an explanation.
 `policy allow test` overrides that requirement; benchmark permission is separate.
 For a command allowlist, use `policy preset deny-all`, then add `allow` rules.
 `policy preset allow-all` removes all restrictions. Presets replace existing rules.

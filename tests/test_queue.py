@@ -367,6 +367,34 @@ kyoto.worker(Path(sys.argv[1]))
         self.assertEqual(checked['estimate_source'], 'command-class prior')
         self.assertGreater(compiled['estimate'], checked['estimate'])
 
+    def test_automatic_test_compilation_runs_effective_command_and_reports_logs(self):
+        cargo = Path(self.temp.name) / 'cargo'
+        cargo.write_text("#!/bin/sh\nprintf '%s\\n' \"$@\"\n"
+                         "for arg do\n  if [ \"$arg\" = --no-run ]; then exit 0; fi\ndone\n"
+                         "echo 'test execution requested'\nexit 7\n")
+        cargo.chmod(0o700)
+        requested = [str(cargo), 'test', '--', '--nocapture']
+        job = json.loads(self.cli('submit', '--', *requested).stdout)
+        result = self.wait(job['id'])
+        self.assertEqual(result['status'], 'succeeded')
+        self.assertEqual(result['command'], requested[:2] + ['--no-run'] + requested[2:])
+        self.assertEqual(result['requested_command'], requested)
+        self.assertIn('will not run', result['policy_message'])
+        output = self.cli('logs', job['id']).stdout
+        self.assertIn('--no-run', output)
+        self.assertNotIn('test execution requested', output)
+        self.assertEqual(Path(result['log']).read_text(), output)
+        self.cli('policy', 'allow', 'test')
+        job = json.loads(self.cli('submit', '--', *requested).stdout)
+        waited = self.cli('wait', job['id'], check=False)
+        result = json.loads(waited.stdout)
+        self.assertEqual(waited.returncode, 7)
+        self.assertEqual(result['status'], 'failed')
+        self.assertEqual(result['exit_code'], 7)
+        self.assertEqual(result['command'], requested)
+        self.assertIsNone(result['policy_message'])
+        self.assertIn('test execution requested', self.cli('logs', job['id']).stdout)
+
     def test_build_state_histories_do_not_mix(self):
         code = 'print("state learning")'
         cold = self.submit_with(code, '--build-state', 'cold')

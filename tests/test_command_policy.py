@@ -173,3 +173,19 @@ class PolicyTest(unittest.TestCase):
         self.assertEqual(result['command'], ['cargo', 'test', '--no-run'])
         self.assertIn('will not run', result['policy_message'])
         self.assertEqual(result['log'], str(self.root.resolve() / (job['id'] + '.log')))
+
+    def test_doc_tests_require_execution_but_doc_argument_values_do_not(self):
+        with self.assertRaisesRegex(ValueError, 'documentation tests'):
+            prepare_submission(['cargo', 'test', '--doc'], self.db)
+        with self.assertRaisesRegex(ValueError, 'documentation tests'):
+            prepare_submission(['cargo', 'test', '--doc', '--no-run'], self.db)
+        for command in (['cargo', 'test', '--', '--doc'],
+                        ['cargo', 'test', '--config', '--doc']):
+            effective, info, _ = prepare_submission(command, self.db)
+            self.assertEqual(info['kind'], 'test-compile')
+        self.rule('allow', 'test')
+        command = ['cargo', 'test', '--doc']
+        effective, info, message = prepare_submission(command, self.db)
+        self.assertEqual(effective, command)
+        self.assertEqual(info['kind'], 'test-run')
+        self.assertIsNone(message)
