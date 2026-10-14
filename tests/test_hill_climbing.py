@@ -494,7 +494,7 @@ class HillClimbingTest(unittest.TestCase):
         self.setUp()
         self.begin_up()
         busy = measured_host(cpu_percent=97, available_mb=1300,
-            disk_io={'valid': True, 'state': 'measured', 'devices': {'disk0': {'read_ms': 45, 'read_iops': 50}}})
+            disk_io={'valid': True, 'state': 'measured', 'devices': {'disk0': {'read_ms': 45, 'read_iops': 50, 'write_ms': None, 'write_iops': 0}}})
         self.update(11, [command('a', 11), command('b', 0)], busy)
         policy, host = self.update(21, [command('a', 18), command('b', 7)], busy)
         self.assertEqual(policy['max_running'], 1)
