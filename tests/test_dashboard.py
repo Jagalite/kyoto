@@ -1,7 +1,7 @@
 import json
 import contextlib
 import io
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 import os
 from pathlib import Path
 import subprocess
@@ -9,7 +9,7 @@ import sys
 import tempfile
 import unittest
 
-from dashboard import clean, clipped, log_tail, plain, read_snapshot, watch, cpu_summary
+from dashboard import clean, clipped, log_tail, plain, read_snapshot, watch, cpu_summary, JobViewport, screen_loop
 from kyoto import connect
 
 SCRIPT = str(Path(__file__).resolve().parents[1] / 'kyoto.py')
@@ -110,6 +110,57 @@ class DashboardTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0)
             self.assertIn('KYOTO', result.stdout)
             self.assertNotIn('\x1b', result.stdout)
+
+
+class ViewportTest(unittest.TestCase):
+    def test_refresh_inserts_and_reorders_keep_selected_job_on_same_screen_row(self):
+        viewport = JobViewport()
+        viewport.scroll('selected', 5, 9, 12)
+        row = viewport.row
+        for position in (7, 13, 9, 5):
+            offset = viewport.scroll('selected', position, 9, 12)
+            self.assertEqual(9 + position - offset, row)
+
+    def test_navigation_scrolls_only_at_viewport_edges(self):
+        viewport = JobViewport()
+        self.assertEqual(viewport.scroll('a', 1, 9, 8), 0)
+        self.assertEqual(viewport.scroll('b', 3, 9, 8), 0)
+        self.assertEqual(viewport.scroll('c', 9, 9, 8), 3)
+        self.assertEqual(viewport.scroll('b', 3, 9, 8), 3)
+        self.assertEqual(viewport.scroll('a', 1, 9, 8), 1)
+
+    def test_resize_group_changes_and_empty_list_keep_selection_visible(self):
+        viewport = JobViewport()
+        viewport.scroll('a', 20, 9, 12)
+        row = viewport.row
+        viewport.scroll('a', 22, 11, 12)
+        self.assertEqual(viewport.row, row)
+        offset = viewport.scroll('a', 22, 11, 4)
+        self.assertLessEqual(22 - offset + 2, 4)
+        self.assertEqual(viewport.scroll('a', 0, 11, 4), 0)
+        self.assertEqual(viewport.scroll(None, 0, 11, 4), 0)
+        self.assertIsNone(viewport.selected_id)
+        self.assertEqual(viewport.scroll('new', 1, 11, 4), 0)
+
+    def test_screen_loop_keeps_job_identity_through_insertion_and_completion(self):
+        def snapshot(rows):
+            return {'jobs': [dict(id=id, status=status) for id, status in rows]}
+        frames = [snapshot([('a', 'running'), ('b', 'queued')]),
+                  snapshot([('new', 'running'), ('a', 'running'), ('b', 'queued')]),
+                  snapshot([('new', 'running'), ('b', 'running'), ('a', 'succeeded')])]
+        screen = Mock()
+        screen.getch.side_effect = [ord('j'), ord('r'), ord('r'), ord('q')]
+        selected = []
+        def draw(screen, snapshot, root, index, *args):
+            selected.append(snapshot['jobs'][index]['id'])
+        with patch('dashboard.curses.curs_set'), patch('dashboard.palette', return_value={}), \
+             patch('dashboard.WorkerRecovery') as recovery, \
+             patch('dashboard.read_snapshot', side_effect=frames), \
+             patch('dashboard.draw_dashboard', side_effect=draw), \
+             patch('dashboard.time.monotonic', return_value=1):
+            recovery.return_value.refresh.return_value = None
+            screen_loop(screen, Path('/unused'), 10, None, Mock())
+        self.assertEqual(selected, ['a', 'b', 'b', 'b'])
 
 
 if __name__ == '__main__':

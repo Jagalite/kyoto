@@ -270,7 +270,28 @@ def short(text, width):
     return clipped_text if clipped_text == text else clipped(text, max(0, width - 1)) + '…'
 
 
-def draw_dashboard(screen, snapshot, root, selected, logs, styles, error=None):
+class JobViewport:
+    """Anchor refreshes to the selected job's screen row; scroll for navigation."""
+    def __init__(self):
+        self.offset = 0
+        self.selected_id = None
+        self.row = None
+
+    def scroll(self, selected_id, position, top, visible):
+        if selected_id is None:
+            self.offset, self.selected_id, self.row = 0, None, None
+            return 0
+        if selected_id == self.selected_id and self.row is not None:
+            self.offset = max(0, position - (self.row - top))
+        # Keep both lines of the selected job visible when space permits.
+        self.offset = min(self.offset, position)
+        self.offset = max(0, self.offset, position + min(2, visible) - visible)
+        self.selected_id = selected_id
+        self.row = top + position - self.offset
+        return self.offset
+
+
+def draw_dashboard(screen, snapshot, root, selected, logs, styles, error=None, viewport=None):
     height, width = screen.getmaxyx()
     screen.erase()
 
@@ -353,7 +374,10 @@ def draw_dashboard(screen, snapshot, root, selected, logs, styles, error=None):
         positions[index] = len(entries)
         entries.extend([('job', job, index), ('command', job, index)])
     visible = max(1, list_end - list_top)
-    offset = max(0, positions.get(selected, 0) + 2 - visible)
+    if viewport is None:
+        viewport = JobViewport()
+    offset = viewport.scroll(jobs[selected]['id'] if jobs else None,
+                             positions.get(selected, 0), list_top, visible)
     for line, (kind, value, index) in enumerate(entries[offset:offset + visible]):
         row = list_top + line
         if kind == 'spacer':
@@ -474,6 +498,7 @@ def screen_loop(screen, root, interval, history, sizes):
     styles = palette()
     selected_id = None
     selected = 0
+    viewport = JobViewport()
     logs = False
     snapshot = dict(config=dict(DEFAULT_CONFIG, paused=False), runtime=None, jobs=[],
                     now=time.time(), fresh=False, reason='Loading', active_count=0)
@@ -500,7 +525,7 @@ def screen_loop(screen, root, interval, history, sizes):
             next_refresh = time.monotonic() + interval
         jobs = snapshot['jobs']
         sizes.update([j for j in jobs if j['status'] in ('queued', 'running') or j['id'] == selected_id], selected_id)
-        draw_dashboard(screen, snapshot, root, selected, logs, styles, error)
+        draw_dashboard(screen, snapshot, root, selected, logs, styles, error, viewport)
         screen.refresh()
         screen.timeout(max(1, min(250, int((next_refresh - time.monotonic()) * 1000))))
         key = screen.getch()
