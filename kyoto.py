@@ -312,13 +312,13 @@ def worker(root):
             if now - last_host_sample >= SAMPLE_SECONDS or config != last_config:
                 queued = [job_dict(r) for r in db.execute("SELECT * FROM jobs WHERE status='queued' AND cancel=0")]
                 running = [job_dict(r) for r in db.execute("SELECT * FROM jobs WHERE status='running'")]
-                progress_tracker.prune([j['id'] for j in running] if config['mode'] == 'hill-climb' else [])
-                if config['mode'] == 'hill-climb':
+                progress_tracker.prune([j['id'] for j in running] if config['mode'] in ('hill-climb', 'kyoto') else [])
+                if config['mode'] in ('hill-climb', 'kyoto'):
                     for job in running:
                         job['progress'] = progress_tracker.sample(root, job, now)
                 host = sample_host()
                 policy, pressure_snapshot = controller.update(config, host, queued, running, time.monotonic())
-                if config['mode'] == 'hill-climb':
+                if config['mode'] in ('hill-climb', 'kyoto'):
                     pressure_snapshot['job_progress'] = {j['id']: j['progress'] for j in running}
                 pressure_snapshot['accounted_rss_mb'] = {j['id']: j['current_rss_mb'] for j in running}
                 pressure_snapshot['config'] = config
@@ -329,6 +329,7 @@ def worker(root):
                 pressure_snapshot['supports_recovery'] = True
                 pressure_snapshot['supports_restart'] = True
                 pressure_snapshot['supports_hill_climb'] = True
+                pressure_snapshot['supports_kyoto'] = True
                 pressure_snapshot['signal_errors'] = {job_id: state['signal_error'] for job_id, state in active.items()
                                                       if state.get('signal_error')}
                 pressure_snapshot['recovery_ready'] = recovery_ready
@@ -711,8 +712,8 @@ def main():
         rule.add_argument('--scope', choices=['cargo', 'args'], default='cargo', help='Cargo options or arguments after --')
         rule.add_argument('--max-value', type=positive_int, required=action == 'limit')
     configure = commands.add_parser('config', help='Show or update shared live scheduling policy')
-    configure.add_argument('--mode', choices=['fifo', 'smart', 'hill-climb'], help='hill-climb is experimental; learns concurrency from command progress')
-    configure.add_argument('--max-running', type=concurrency_limit, help='Positive integer or auto; upper bound in hill-climb mode')
+    configure.add_argument('--mode', choices=['fifo', 'smart', 'hill-climb', 'kyoto'], help='kyoto combines Smart queue routing with measured adaptive concurrency')
+    configure.add_argument('--max-running', type=concurrency_limit, help='Positive integer or auto; concurrency ceiling in hill-climb and kyoto modes')
     configure.add_argument('--pressure-aware', choices=['on', 'off'], help='Gate new starts on memory, swap, and disk pressure')
     configure.add_argument('--auto-defer', choices=['on', 'off'], help='Stop and requeue eligible builds for sustained pressure or short-job priority (default on)')
     configure.add_argument('--cpu-budget', type=positive_int)

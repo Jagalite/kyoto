@@ -89,6 +89,24 @@ The test restriction recognizes Cargo commands and common wrappers; it does not
 inspect arbitrary shell scripts or custom aliases. Do not submit test execution
 through those wrappers.
 
+## Kyoto mode: unified adaptive scheduling
+
+`kyoto` is an opt-in mode that keeps Smart job ordering and safe preemption active
+while using measured hill climbing to adjust concurrency. It uses a bounded
+fallback for missing progress, and explicitly degraded progress-based learning
+when disk telemetry has never been available (for example on Linux). Pressure,
+configuration limits, locks, and cancellation remain independent safety gates.
+Smart stays the default until real build qualification establishes a reason to
+change it.
+
+```sh
+python3 kyoto.py config --mode kyoto --max-running auto
+python3 kyoto.py health
+```
+
+See [Kyoto mode architecture and limitations](docs/KYOTO_MODE.md) and the
+[reproducible Smart/Hill/Kyoto comparison](experiments/kyoto_mode_comparison.py).
+
 ## Progress-driven hill climbing
 
 The `hill-climb` mode uses the production controller, including bounded

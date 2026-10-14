@@ -44,10 +44,10 @@ def choose_job(queued, running, config, now, available_mb=None):
     ordered = sorted(queued, key=lambda j: (j['submitted'], j['id']))
     from preemption import short_job
     aged = now - ordered[0]['submitted'] >= config['aging_seconds']
-    if config['mode'] == 'smart' and any(j['id'] in preferred for j in queued):
+    if config['mode'] in ('smart', 'kyoto') and any(j['id'] in preferred for j in queued):
         candidates = sorted((j for j in queued if j['id'] in preferred), key=lambda j: (j['estimate'], j['submitted'], j['id']))
         reason = 'short job granted preemption'
-    elif config['mode'] == 'smart' and any(short_job(j) for j in queued):
+    elif config['mode'] in ('smart', 'kyoto') and any(short_job(j) for j in queued):
         candidates = sorted((j for j in queued if short_job(j)), key=lambda j: (j['estimate'], j['submitted'], j['id']))
         reason = 'shortest estimated job (under ten minutes)'
     elif config['mode'] == 'fifo' or aged:

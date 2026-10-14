@@ -63,7 +63,7 @@ def _resources(snapshot):
     cpu, available, total = (snapshot.get(name) for name in ('cpu_percent', 'available_mb', 'total_mb'))
     disk = snapshot.get('disk_io') or {}
     swaps = [snapshot.get('swap_' + direction + '_mb_per_second') for direction in ('in', 'out')]
-    known = host_known(snapshot) and disk_known(disk)
+    known = host_known(snapshot) and (disk_known(disk) or snapshot.get('_kyoto_partial_disk') is True)
     if not known:
         return False, None, False
     fraction = available / total
@@ -71,7 +71,7 @@ def _resources(snapshot):
     ram_cost = max(0, .2 - fraction) * 2
     swap_cost = min(.3, sum(swaps) * 2)
     disk_cost = 0
-    for metrics in disk['devices'].values():
+    for metrics in disk['devices'].values() if disk_known(disk) else ():
         for direction in ('read', 'write'):
             latency, iops = metrics.get(direction + '_ms'), metrics.get(direction + '_iops')
             if _finite(latency) and _finite(iops) and iops >= 10:
@@ -364,8 +364,11 @@ class HillClimbingController:
                             turnover_warmup_seconds=(now - self.turnover_started
                                                      if self.turnover_started is not None else 0),
                             per_job_rates=dict(self.per_job_rates), resource_factor=factor,
-                            telemetry_complete=bool(known), probe_headroom=bool(headroom),
-                            telemetry_state=('paused' if telemetry_blocked else 'recovering'
+                            telemetry_complete=bool(host_known(snapshot) and disk_known(snapshot.get('disk_io') or {})),
+                            partial_resource_observation=bool(known and not disk_known(snapshot.get('disk_io') or {})),
+                            probe_headroom=bool(headroom),
+                            telemetry_state=('paused' if telemetry_blocked else 'partial'
+                                if known and not disk_known(snapshot.get('disk_io') or {}) else 'recovering'
                                 if self.telemetry_pause.recovering else 'measured' if known else 'unavailable'),
                             telemetry_grace_seconds=self.telemetry_pause.grace_seconds,
                             telemetry_pause_seconds=(now - self.telemetry_pause.since

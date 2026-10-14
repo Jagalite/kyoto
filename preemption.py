@@ -22,7 +22,7 @@ def finishing_soon(job, now):
 
 def choose_preemption(config, policy, queued, running, now, eligible_ids):
     from scheduling import choose_job
-    if config.get('paused') or not config.get('auto_defer', True) or config['mode'] != 'smart':
+    if config.get('paused') or not config.get('auto_defer', True) or config['mode'] not in ('smart', 'kyoto'):
         return None
     if any(j.get('deferring') for j in running) or policy['max_running'] <= 0:
         return None
@@ -42,7 +42,16 @@ def choose_preemption(config, policy, queued, running, now, eligible_ids):
             others = [j for j in running if j['id'] != job['id']]
             if choose_job([waiting], others, policy, now)[0] is not None:
                 candidates.append(job)
+            elif config['mode'] == 'kyoto' and len(running) > policy['max_running']:
+                # A rejected upward trial can still occupy a real process.
+                # Prefer safe, recently started victims to restore a slot for
+                # a known short job, one deferral at a time. Respect locks.
+                room = dict(policy, max_running=len(others) + 1)
+                if choose_job([waiting], others, room, now)[0] is not None:
+                    candidates.append(job)
         if candidates:
-            victim = max(candidates, key=lambda j: ((j.get('estimate') or 0) - (now - j['started']), j['id']))
+            victim = (min(candidates, key=lambda j: (max(0, now-j['started']), j['id']))
+                      if config['mode'] == 'kyoto' else
+                      max(candidates, key=lambda j: ((j.get('estimate') or 0) - (now - j['started']), j['id'])))
             return victim, waiting
     return None

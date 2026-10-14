@@ -73,7 +73,9 @@ POLICIES = ['fifo-auto', 'fifo-8', 'smart-auto', 'smart-no-defer',
 
 def config_for(name):
     config = dict(DEFAULT_CONFIG, cpu_budget=8, paused=False)
-    if name.startswith('hill-'):
+    if name == 'kyoto-auto':
+        config.update(mode='kyoto')
+    elif name.startswith('hill-'):
         config.update(mode='hill-climb')
     elif name.startswith('fifo-'):
         config.update(mode='fifo', max_running='auto' if name.endswith('auto') else 8)
