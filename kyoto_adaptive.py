@@ -30,6 +30,7 @@ class KyotoController:
         self.state = 'discovery'
         self.first_sample_at = None
         self.ever_measured_disk = False
+        self.was_degraded = False
 
     def update(self, config, snapshot, queued, running, now):
         if self.first_sample_at is None and _finite(now):
@@ -43,6 +44,18 @@ class KyotoController:
                         and self.first_sample_at is not None and _finite(now)
                         and now - self.first_sample_at >= FALLBACK_GRACE_SECONDS
                         and host_known(snapshot) and not snapshot.get('disk_pressure'))
+        # A return of real disk counters changes what the resource objective
+        # measures. Discard the partial-window/probe baseline; otherwise the
+        # new disk penalty could be misattributed to a concurrency change.
+        if self.was_degraded and disk_complete and _finite(now):
+            cap = snapshot.get('concurrency_ceiling', config['cpu_budget'])
+            observed_count = min(max(1, len(running)), max(1, cap))
+            self.hill._reset(now, 'kyoto disk telemetry recovered; new objective baseline',
+                             target=observed_count)
+            self.hill.next_probe_at = now
+            if observed_count > 1:
+                self.hill.next_direction = 'down'
+        self.was_degraded = partial_disk
         learning_snapshot = dict(snapshot)
         if partial_disk:
             learning_snapshot['_kyoto_partial_disk'] = True

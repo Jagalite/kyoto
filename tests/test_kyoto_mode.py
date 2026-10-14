@@ -63,6 +63,18 @@ class KyotoModeTest(unittest.TestCase):
         self.assertEqual(h['hill_climb']['telemetry_state'], 'partial')
         self.assertEqual(p['max_running'], 2)
 
+    def test_returning_disk_counters_restarts_partial_objective(self):
+        for t, value in ((0, 0), (10, 50), (20, 150)):
+            self.observe(t, [job('a', value)], host_sample=host(disk=False))
+        self.assertTrue(self.controller.was_degraded)
+        policy, sample = self.observe(22, [job('a', 165)], host_sample=host(disk=True))
+        self.assertFalse(self.controller.was_degraded)
+        self.assertFalse(sample['kyoto']['degraded_optimization'])
+        self.assertTrue(sample['hill_climb']['telemetry_complete'])
+        self.assertIsNone(sample['hill_climb']['objective'])
+        self.assertIn(sample['hill_climb']['phase'], ('baseline', 'cooldown'))
+        self.assertEqual(policy['max_running'], 1)
+
     def test_unknown_progress_fallback_is_bounded_not_smart_eight(self):
         for t in range(0, 100, 2):
             p, h = self.observe(t, [job('a', measured=False)])
