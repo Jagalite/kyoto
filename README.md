@@ -44,10 +44,11 @@ kyoto.py restart                            # Reload worker code, preserving bui
 
 ## Tests and scheduling
 
-By default Kyoto schedules test compilation only. Submitting `cargo test` or
-`cargo bench` automatically adds `--no-run` when the shared compile-only policy
-requires it. If execution is allowed, the command runs as requested. Run tests
-and benchmarks outside Kyoto, or explicitly change the shared admin policy:
+Submit `cargo test` or `cargo bench` normally, without a compilation-only flag.
+Kyoto chooses compilation only or compilation plus execution from the shared
+policy. The default is compilation only, which the returned `policy_message`
+explains. After compilation, run tests and benchmarks outside Kyoto, or
+explicitly change the shared admin policy:
 
 ```sh
 kyoto.py submit -- cargo test                           # Compile only under default policy
@@ -204,9 +205,9 @@ matches `profile=release`. Repeated values are all checked. `--scope cargo` is
 the default; `--scope args` examines arguments following Cargo's `--` separator.
 Cargo help/version requests are exempt from `require` rules.
 
-The initial preset allows commands but requires `--no-run` for test/bench.
-Planning and submission add it automatically when that requirement blocks test
-execution; other denials still apply. Explicit `--no-run` always stays compile-only.
+The initial preset allows commands but limits tests and benchmarks to compilation.
+Callers submit ordinary `cargo test` and `cargo bench` commands; Kyoto handles
+the Cargo compilation flag internally. Other policy denials still apply.
 JSON responses include `requested_command`, the effective `command`, and a
 `policy_message` explaining automatic compilation-only behavior. The message
 persists in `show`, `wait`, and history results, including after completion.
