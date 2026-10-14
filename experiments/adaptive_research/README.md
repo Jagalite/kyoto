@@ -1,9 +1,12 @@
 # Adaptive scheduling research
 
-Read [REPORT.md](REPORT.md) for the findings and qualification plan. This is a
-research-only addition: it does not change Kyoto's scheduler, default mode,
-shared queue, or production telemetry behavior. Experimental policy adapters
-must not be copied into the worker without the integration work described there.
+Read [REPORT.md](REPORT.md) for the historical research findings and qualification
+plan. The production implementation is now in the root `hill_climbing.py` and
+`hill_telemetry.py`; see [its contract and current qualification](../../docs/HILL_CLIMBING.md).
+The frozen research adapters here remain experiments, not worker implementations.
+`production.py` compares the actual runtime implementation with the frozen baseline
+without replacing the original study or claiming the prototype's results apply
+unchanged to production.
 
 The baseline is `337f5fd7dc79e019ce0912c827363228c5c10be8`. The two files in
 `vendor/` are exact Git blobs from that revision. `pinned.py` checks both hashes
@@ -28,6 +31,28 @@ it is not duplicated in Git. Its checksum is recorded in the provenance file.
 All primary simulation and noise data can be regenerated with the commands below.
 The original study's excluded pilots and invalid initial native startup-timeout
 run are not part of the committed evidence or the reported primary counts.
+
+## Production comparison
+
+The production runner needs only the Python standard library. It extends decision
+logging, not the live algorithm, and never launches a Kyoto worker or opens queue
+state. Model failures, resource observations, and work service remain synthetic.
+The 2,064-run default grid compares the frozen baseline, original pause prototype,
+and actual production controller: 1,488 main runs, 432 additional telemetry runs,
+and 144 finer-step runs. The runner records hashes, assumptions, raw rows and
+paired summaries; changing source during a run is an error.
+
+```sh
+python3 experiments/adaptive_research/production.py --workers 4 --output /tmp/kyoto-production.json
+# Small replay, using the same controller:
+python3 experiments/adaptive_research/production.py --suite main --seeds 1,101 \
+  --scenarios finite-control,telemetry-dropout-120s --output /tmp/kyoto-production-smoke.json
+```
+
+[Recorded production results](results/production_summary.csv) distinguish the
+22.54% production gain in the dropout model from the 25.7% original prototype gain.
+The other 30 main scenarios have identical physical results to the old controller.
+This is bounded model evidence, not measured Cargo speedup.
 
 ## Reproduce in an isolated environment
 
@@ -80,7 +105,7 @@ selection among the explored policy variants.
 
 ## Safety and qualification boundaries
 
-The synthetic suites execute the vendored controller and objective, not
+The original synthetic suites execute the vendored controller and objective, not
 `AdaptiveController`, production queue ordering, pressure deferral, or the Kyoto
 worker. They do not open a state database or run Cargo. Fixed references use the
 model's gates; they are not Smart mode or an oracle scheduler.

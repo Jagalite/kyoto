@@ -89,9 +89,13 @@ The test restriction recognizes Cargo commands and common wrappers; it does not
 inspect arbitrary shell scripts or custom aliases. Do not submit test execution
 through those wrappers.
 
-## Experimental hill climbing
+## Progress-driven hill climbing
 
-**Experimental; general convergence and hardware performance are not qualified.**
+The `hill-climb` mode uses the production controller, including bounded
+telemetry recovery. It is not the research adapter. Smart remains the default.
+See [the controller contract and qualification results](docs/HILL_CLIMBING.md).
+
+**General convergence and workload-specific hardware performance are not guaranteed.**
 Closed-loop model tests now settle near the known optimum for finite workloads,
 including noisy observations and mixed job sizes. Sparse counters and changing
 workloads remain imperfect, and a rejected extra slot stays occupied until a
@@ -100,7 +104,7 @@ for comparisons with the original implementation and the remaining limits.
 
 `hill-climb` learns a concurrency limit from **progress per command** and measured
 CPU use, available RAM, swap activity, and disk latency/contention. Smart mode
-remains the default. Try the experiment in its own queue first, using the same
+remains the default. Evaluate this mode in its own queue first, using the same
 `--state` path for every command:
 
 ```sh
@@ -131,7 +135,14 @@ specific to smart mode. Explicit resource locks and aging continue to apply.
 
 `--max-running N` is an upper bound in this mode; `auto` uses `--cpu-budget` as
 its upper bound. Missing totals, progress, or resource measurements normally
-keep admission at one slot. A newly admitted command has bounded startup time
+keep admission at one slot. A brief disk-sensor interruption after a measured
+limit has been learned instead closes admission for at most ten seconds while
+retaining that limit. It discards the interrupted rate window and probe; recovery
+starts fresh measurements. Retry/phase/counter changes, a reduced cap, memory or
+swap pressure, and worker restarts cannot inherit this grace. Repeated sensor
+flicker cannot renew it without a productive measured window. A persistent outage
+returns to the one-slot fallback. Running commands are never stopped by this
+telemetry mechanism. A newly admitted command has bounded startup time
 to report its first counter during an upward trial or an ordinary refill of a
 learned limit (120 seconds by default). Refill grace requires a measured surviving
 incumbent. Known commands losing progress do not get this grace period.
@@ -140,7 +151,8 @@ require new measurements. Ordinary completions preserve the learned limit.
 No optimizer state is carried
 across worker restarts. The dashboard shows the current decision; `health`
 includes `runtime.hill_climb` diagnostics (target, actual running count, drain
-duration, measured rates, hold cause, and trial decisions) and `runtime.job_progress` for each
+duration, measured rates, hold cause, trial decisions, qualified limit, telemetry
+state, and whether admission is paused for telemetry) and `runtime.job_progress` for each
 running command. `show` and `status` expose progress and its source as well.
 
 Cargo progress bars, libtest results, Cargo JSON artifact messages, and ordinary
