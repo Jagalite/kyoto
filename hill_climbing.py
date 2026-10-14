@@ -1,4 +1,8 @@
-"""Experimental, progress-driven concurrency search; never controls processes.
+"""Progress-driven concurrency search with bounded observation recovery.
+
+Resource safety gates remain independent of learning; this controller never
+controls processes. Brief disk-telemetry failures close admission without
+forgetting a qualified limit, but invalidate every interrupted comparison.
 
 Known totals turn counters into completed phase fractions. A probe compares the
 sum of measured fractions per second before and after changing admission. Every
@@ -11,6 +15,7 @@ comparisons. Reducing the target only withholds starts: existing work drains.
 from collections import deque
 import math
 from progress_objective import measure_progress
+from hill_telemetry import TelemetryPause, disk_known, host_known
 
 
 WINDOW_SECONDS = 10
@@ -35,6 +40,8 @@ def _measurements(running):
     result = {}
     for job in running:
         progress = job.get('progress') or {}
+        if not isinstance(progress, dict):
+            continue
         measurement = progress.get('measurement')
         if not progress.get('measurable') or not isinstance(measurement, dict):
             continue
@@ -56,10 +63,7 @@ def _resources(snapshot):
     cpu, available, total = (snapshot.get(name) for name in ('cpu_percent', 'available_mb', 'total_mb'))
     disk = snapshot.get('disk_io') or {}
     swaps = [snapshot.get('swap_' + direction + '_mb_per_second') for direction in ('in', 'out')]
-    known = (snapshot.get('valid') and _finite(cpu) and 0 <= cpu <= 100
-             and _finite(available) and _finite(total) and total > 0 and 0 <= available <= total
-             and all(_finite(v) and v >= 0 for v in swaps)
-             and disk.get('valid') and disk.get('state') == 'measured' and bool(disk.get('devices')))
+    known = host_known(snapshot) and disk_known(disk)
     if not known:
         return False, None, False
     fraction = available / total
@@ -78,13 +82,18 @@ def _resources(snapshot):
 
 class HillClimbingController:
     def __init__(self, *, window_seconds=None, cooldown_seconds=None,
-                 max_gap_seconds=None, probe_timeout_seconds=None):
+                 max_gap_seconds=None, probe_timeout_seconds=None, telemetry_grace_seconds=None):
         self.window_seconds = WINDOW_SECONDS if window_seconds is None else window_seconds
         self.cooldown_seconds = COOLDOWN_SECONDS if cooldown_seconds is None else cooldown_seconds
         self.max_gap_seconds = MAX_GAP_SECONDS if max_gap_seconds is None else max_gap_seconds
         self.probe_timeout_seconds = PROBE_TIMEOUT_SECONDS if probe_timeout_seconds is None else probe_timeout_seconds
-        if min(self.window_seconds, self.max_gap_seconds, self.probe_timeout_seconds) <= 0 or self.cooldown_seconds < 0:
+        intervals = (self.window_seconds, self.max_gap_seconds, self.probe_timeout_seconds, self.cooldown_seconds)
+        if (not all(_finite(value) for value in intervals)
+                or min(intervals[:3]) <= 0 or self.cooldown_seconds < 0):
             raise ValueError('hill climbing intervals must be positive; cooldown may be zero')
+        self.telemetry_pause = TelemetryPause(telemetry_grace_seconds)
+        self.last_measurements = {}
+        self.qualified_target = 1
         self.target = 1
         self.phase = 'baseline'
         self.reason = 'collecting progress baseline'
@@ -111,6 +120,9 @@ class HillClimbingController:
         self.decisions.append(dict(at=now, action=action, target=self.target, reason=reason, **details))
 
     def _reset(self, now, reason, target=1, phase='baseline'):
+        self.telemetry_pause.reset()
+        self.last_measurements = {}
+        self.qualified_target = 1
         self.target = target
         self.probe = self.window = None
         self.per_job_rates = {}
@@ -134,6 +146,7 @@ class HillClimbingController:
         # An inconclusive downward trial must not admit replacement work while
         # draining. Its lower target is conservative until it can be remeasured.
         self.target = min(self.target, self.probe['from_target'])
+        self.qualified_target = min(self.qualified_target, self.target)
         self.probe = self.window = None
         self.phase = 'cooldown'
         self.next_probe_at = now + self.cooldown_seconds
@@ -175,6 +188,10 @@ class HillClimbingController:
         maximum = max(self.window_seconds, min(MAX_WINDOW_SECONDS, self.probe_timeout_seconds * .75))
         if elapsed < maximum and any(rate == 0 for rate in rates.values()):
             return None, False
+        if result['eligible'] and all(rate > 0 for rate in rates.values()):
+            self.telemetry_pause.qualify()
+            if not self.probe and len(rates) == self.target:
+                self.qualified_target = self.target
         observation = dict(rates=rates, count=len(rates), factor=old['cost'] / elapsed,
                            elapsed=elapsed, measurements=measurements,
                            normalized_rates=result['normalized_rates'],
@@ -219,6 +236,8 @@ class HillClimbingController:
             self.target = probe['from_target']
             if probe['direction'] == 'up':
                 self.rejected_limit = self.target + 1
+        if accepted:
+            self.qualified_target = self.target
         self.holding = not accepted
         self.hold_cause = 'rejected' if self.holding else None
         self.next_direction = probe['direction']
@@ -245,7 +264,12 @@ class HillClimbingController:
         coverage = len(measurements) / len(running) if running else 0.
         scoring_coverage = sum(m['total'] is not None for m in measurements.values()) / len(running) if running else 0.
         known, factor, headroom = _resources(snapshot)
-        hard_blocked = snapshot.get('effective_max_running') == 0
+        invalid_clock = not _finite(now)
+        if invalid_clock:
+            now = self.last_time if self.last_time is not None else 0.
+            snapshot['admission_reason'] = 'invalid observation clock; admission closed'
+        hard_blocked = snapshot.get('effective_max_running') == 0 or invalid_clock
+        telemetry_blocked = False
         clock_reset = self.last_time is not None and (now < self.last_time or now - self.last_time > self.max_gap_seconds)
         self.last_time = now
         if hard_blocked:
@@ -259,14 +283,42 @@ class HillClimbingController:
             self._reset(now, 'waiting for a running command', phase='idle')
             # The first productive window can explore without an idle cooldown.
             self.next_probe_at = now
-        elif not known:
-            self._reset(now, 'host telemetry incomplete; one-slot fallback', phase='unavailable')
         elif clock_reset:
             self._reset(now, 'observation clock gap; collecting a fresh baseline')
         else:
             if self.target > cap or (self.probe and self.probe['from_target'] > cap):
                 self._reset(now, 'concurrency ceiling changed', target=min(self.target, cap))
-            if coverage < 1 and not self._newcomer_warmup(running, measurements):
+            pause = None
+            if host_known(snapshot):
+                # A trial's extra slot is not a learned limit. _abort below
+                # rolls it back without pretending the process has stopped.
+                qualified = min(self.qualified_target, self.target,
+                    self.probe['from_target'] if self.probe else self.target) > 1
+                pause = self.telemetry_pause.advance(
+                    now, measurements, len(running), missing=not known,
+                    may_start=qualified, previous=self.last_measurements)
+            else:
+                self.telemetry_pause.reset()
+            if pause in ('invalidated', 'expired'):
+                self._reset(now, 'telemetry pause ' + pause + '; collecting a fresh baseline')
+                pause = None
+            if pause == 'pause':
+                if self.probe:
+                    self._abort(now, 'telemetry gap invalidates probe')
+                if self.phase != 'telemetry-pause':
+                    self._decision(now, 'telemetry-pause', 'temporary disk telemetry gap; admission closed')
+                self.phase = 'telemetry-pause'
+                self.reason = 'temporary disk telemetry gap; admission closed'
+                self.window = None
+                self.per_job_rates = {}
+                self.objective = None
+                self.reference_rates = {}
+                self.change_work = self.change_expected = self.change_seconds = 0.
+                self.next_probe_at = now + self.cooldown_seconds
+                telemetry_blocked = True
+            elif not known:
+                self._reset(now, 'host telemetry incomplete; one-slot fallback', phase='unavailable')
+            elif coverage < 1 and not self._newcomer_warmup(running, measurements):
                 if self._turnover_warmup(now, running, measurements):
                     # Preserve the qualified admission limit while a genuinely
                     # new replacement emits its first counter. Partial coverage
@@ -284,10 +336,14 @@ class HillClimbingController:
             elif coverage == 1 and scoring_coverage < 1:
                 self._reset(now, 'command progress totals unknown; cannot compare phase completion', phase='unavailable')
             else:
+                if pause == 'resume':
+                    self.window = None
+                    self._decision(now, 'telemetry-resume', 'disk telemetry recovered; collecting fresh measurements')
                 self._advance(config, now, queued, running, measurements, factor, headroom, cap)
         self._remember_attempts(now, running, measurements)
+        self.last_measurements = measurements
         self.target = min(self.target, cap)
-        effective = 0 if hard_blocked or config.get('paused') else self.target
+        effective = 0 if hard_blocked or config.get('paused') or telemetry_blocked else self.target
         if len(running) > self.target:
             if self.drain_started is None:
                 self.drain_started = now
@@ -297,7 +353,8 @@ class HillClimbingController:
         policy = dict(config, max_running=effective, min_available_memory_mb=0)
         snapshot.update(effective_max_running=effective, concurrency_ceiling=cap,
                         admission_reason=reason, effective_memory_reserve_mb=0, automatic=True,
-                        hill_climb=dict(target=self.target, phase=self.phase, reason=self.reason,
+                        hill_climb=dict(target=self.target, qualified_target=self.qualified_target,
+                            phase=self.phase, reason=self.reason,
                             objective=self.objective, objective_kind='aggregate phase completion per second',
                             coverage=coverage, measurable_jobs=len(measurements), running_jobs=len(running),
                             scoring_coverage=scoring_coverage, actual_running=len(running),
@@ -308,6 +365,12 @@ class HillClimbingController:
                                                      if self.turnover_started is not None else 0),
                             per_job_rates=dict(self.per_job_rates), resource_factor=factor,
                             telemetry_complete=bool(known), probe_headroom=bool(headroom),
+                            telemetry_state=('paused' if telemetry_blocked else 'recovering'
+                                if self.telemetry_pause.recovering else 'measured' if known else 'unavailable'),
+                            telemetry_grace_seconds=self.telemetry_pause.grace_seconds,
+                            telemetry_pause_seconds=(now - self.telemetry_pause.since
+                                if self.telemetry_pause.since is not None else 0.),
+                            admission_paused_for_telemetry=telemetry_blocked,
                             next_probe_at=self.next_probe_at, window_seconds=self.window_seconds,
                             decisions=list(self.decisions)))
         return policy, snapshot
@@ -431,6 +494,7 @@ class HillClimbingController:
             self.reason = 'no useful progress in this window'
             if self.target > 1:
                 self.target -= 1
+                self.qualified_target = 1
                 self.window = None
                 self.objective = None
                 self.phase = 'draining'
