@@ -11,7 +11,7 @@ import unittest
 from unittest.mock import patch
 
 import kyoto
-from command_policy import evaluate, read_policy, preset
+from command_policy import evaluate, read_policy, preset, prepare_submission
 
 
 class PolicyTest(unittest.TestCase):
@@ -94,14 +94,14 @@ class PolicyTest(unittest.TestCase):
         return json.loads(output.getvalue())
 
     def test_cli_plan_submit_and_remove(self):
-        with self.assertRaises(SystemExit): self.cli('plan','--','cargo','test')
+        self.assertEqual(self.cli('plan','--','cargo','test')['command'], ['cargo','test','--no-run'])
         rules=self.cli('policy','allow','test')
         rule_id=rules['rules'][-1]['id']
         self.assertTrue(self.cli('plan','--','cargo','test')['policy']['allowed'])
         self.assertEqual(self.cli('submit','--','cargo','test')['command_kind'],'test-run')
         changed=self.cli('policy','remove',str(rule_id))
         self.assertEqual(len(changed['rejected_queued_jobs']),1)
-        with self.assertRaises(SystemExit): self.cli('submit','--','cargo','test')
+        self.assertEqual(self.cli('submit','--','cargo','test')['command_kind'], 'test-compile')
         self.cli('policy','limit','*','--param','j','--max-value','4')
         with self.assertRaises(SystemExit): self.cli('plan','--','cargo','build','-j8')
 
@@ -126,3 +126,50 @@ class PolicyTest(unittest.TestCase):
             self.assertFalse((self.root/(job['id']+'.log')).exists())
         finally:
             worker.terminate();worker.wait(timeout=5)
+
+    def test_wrappers_and_forwarded_arguments(self):
+        for command in [
+            ['cargo', 'test', '--', '--nocapture'],
+            ['cargo', '+stable', 't', '-p', 'example'],
+            ['env', 'A=B', 'rustup', 'run', 'stable', 'cargo', 'bench'],
+        ]:
+            with self.subTest(command=command):
+                effective, info, message = prepare_submission(command, self.db)
+                self.assertFalse(info['executes_tests'])
+                self.assertIn('compiles only', message)
+                self.assertEqual([x for x in effective if x != '--no-run'], command)
+                if '--' in effective:
+                    self.assertLess(effective.index('--no-run'), effective.index('--'))
+
+    def test_allowed_and_explicit_compilation_are_unchanged(self):
+        command = ['cargo', 'test', '--no-run']
+        self.assertEqual(prepare_submission(command, self.db)[::2], (command, None))
+        self.rule('allow', 'test')
+        command = ['cargo', 'test', '--', '--nocapture']
+        effective, info, message = prepare_submission(command, self.db)
+        self.assertEqual(effective, command)
+        self.assertTrue(info['executes_tests'])
+        self.assertIsNone(message)
+
+    def test_other_denials_are_not_bypassed(self):
+        self.rule('deny', 'test')
+        with self.assertRaises(ValueError):
+            prepare_submission(['cargo', 'test'], self.db)
+        preset(self.db, 'compile-only')
+        self.rule('limit', '*', 'jobs', maximum=2)
+        with self.assertRaises(ValueError):
+            prepare_submission(['cargo', 'test', '-j8'], self.db)
+        preset(self.db, 'deny-all')
+        with self.assertRaises(ValueError):
+            prepare_submission(['cargo', 'test'], self.db)
+
+    def test_completion_retains_adjustment_and_log_path(self):
+        job = self.cli('submit', '--', 'cargo', 'test')
+        kyoto.finish(self.db, job['id'], 'succeeded', 0)
+        result = self.cli('wait', job['id'])
+        self.assertEqual(result['status'], 'succeeded')
+        self.assertEqual(result['exit_code'], 0)
+        self.assertEqual(result['requested_command'], ['cargo', 'test'])
+        self.assertEqual(result['command'], ['cargo', 'test', '--no-run'])
+        self.assertIn('will not run', result['policy_message'])
+        self.assertEqual(result['log'], str(self.root.resolve() / (job['id'] + '.log')))

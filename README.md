@@ -44,11 +44,13 @@ kyoto.py restart                            # Reload worker code, preserving bui
 
 ## Tests and scheduling
 
-By default Kyoto schedules test compilation only. Run tests and benchmarks
-outside Kyoto, or explicitly change the shared admin policy:
+By default Kyoto schedules test compilation only. Submitting `cargo test` or
+`cargo bench` automatically adds `--no-run` when the shared compile-only policy
+requires it. If execution is allowed, the command runs as requested. Run tests
+and benchmarks outside Kyoto, or explicitly change the shared admin policy:
 
 ```sh
-kyoto.py submit -- cargo test --no-run                  # Compile tests
+kyoto.py submit -- cargo test                           # Compile only under default policy
 cargo test                                            # Run directly after compilation
 kyoto.py config --mode fifo --max-running 2             # FIFO, two concurrent jobs
 kyoto.py config --mode smart --max-running auto         # Restore defaults
@@ -57,6 +59,10 @@ kyoto.py config --mode smart --max-running auto         # Restore defaults
 Memory pressure can delay new starts. Estimates are approximate. Commands that
 need additional serialization can request `submit --resource /shared/path`.
 Use `kyoto.py --help` or `kyoto.py SUBCOMMAND --help` for options.
+
+Kyoto assigns each job a log file and returns its path in the JSON `log` field.
+There is no custom per-job log-path option. To save output elsewhere, use
+`kyoto.py logs JOB_ID > chosen-file.log`; this exports output captured so far.
 
 Queue state and logs default to `~/.local/state/kyoto`. All participating agents
 should use the same state directory. The database stores full job environments;
@@ -199,6 +205,12 @@ the default; `--scope args` examines arguments following Cargo's `--` separator.
 Cargo help/version requests are exempt from `require` rules.
 
 The initial preset allows commands but requires `--no-run` for test/bench.
+Planning and submission add it automatically when that requirement blocks test
+execution; other denials still apply. Explicit `--no-run` always stays compile-only.
+JSON responses include `requested_command`, the effective `command`, and a
+`policy_message` explaining automatic compilation-only behavior. The message
+persists in `show`, `wait`, and history results, including after completion.
+Existing queued commands are still rechecked, not rewritten, after policy changes.
 `policy allow test` overrides that requirement; benchmark permission is separate.
 For a command allowlist, use `policy preset deny-all`, then add `allow` rules.
 `policy preset allow-all` removes all restrictions. Presets replace existing rules.

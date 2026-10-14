@@ -59,8 +59,9 @@ class PlanTest(unittest.TestCase):
     def test_validation_applies_without_creating_state(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)/'absent'
-            with self.assertRaises(SystemExit):
-                self.invoke(root, '--', 'cargo', 'test')
+            adjusted = self.invoke(root, '--', 'cargo', 'test')
+            self.assertEqual(adjusted['command'], ['cargo', 'test', '--no-run'])
+            self.assertIn('compiles only', adjusted['policy_message'])
             self.assertFalse(root.exists())
             result = self.invoke(root, '--resource', directory, '--', 'cargo', 'test', '--no-run')
             self.assertEqual(result['command_kind'], 'test-compile')

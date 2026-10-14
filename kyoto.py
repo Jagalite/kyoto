@@ -18,7 +18,7 @@ from types import SimpleNamespace
 import recovery
 
 from commands import PRIORS
-from command_policy import initialize as initialize_policy, preset as policy_preset, read_policy, validate_policy, parameter as policy_parameter
+from command_policy import initialize as initialize_policy, preset as policy_preset, read_policy, validate_policy, prepare_submission, parameter as policy_parameter
 from progress import job_progress, ProgressTracker
 from deferral import DeferralController, COOLDOWN_SECONDS, RELIEF_SECONDS
 from preemption import choose_preemption
@@ -28,6 +28,8 @@ from scheduling import (DEFAULT_CONFIG, choose_job, discover_resources, forecast
                         positive, sample_groups, execution_plan)
 
 JOB_COLUMNS = {
+    'requested_command': 'TEXT',
+    'policy_message': 'TEXT',
     'preempt_for': 'TEXT',
     'attempt_token': 'TEXT',
     'allow_retry': 'INTEGER NOT NULL DEFAULT 0',
@@ -125,6 +127,7 @@ def public(row, root, runtime=None):
     item.pop('environment', None)
     item.pop('signature', None)
     item['command'] = json.loads(item['command'])
+    item['requested_command'] = json.loads(item['requested_command']) if item.get('requested_command') else item['command']
     item['log'] = str(root / (item['id'] + '.log'))
     item['elapsed_seconds'] = ((item['finished'] or time.time()) - item['started']) if item['started'] else None
     observed = (runtime or {}).get('job_progress', {}).get(item['id'])
@@ -474,8 +477,9 @@ def submit_job(db, root, args, parser):
     command = args.command[1:] if args.command[:1] == ['--'] else args.command
     if not command:
         parser.error('provide a command after --')
+    requested_command = list(command)
     try:
-        info = validate_policy(command, db)
+        command, info, policy_message = prepare_submission(command, db)
     except ValueError as exc:
         parser.error(str(exc))
     prior_time, prior_cpu, prior_memory = PRIORS[info['kind']]
@@ -505,7 +509,7 @@ def submit_job(db, root, args, parser):
         env.setdefault('CARGO_TERM_PROGRESS_WIDTH', '80')
     preview = args.action == 'plan'
     owner = identity(args.user_id, parser)
-    values = dict(owner_id=owner if preview else owner or str(uuid.uuid4()), command_kind=info['kind'], build_state=args.build_state, allow_test_run=int(info['executes_tests']), allow_retry=int(args.allow_retry),
+    values = dict(requested_command=json.dumps(requested_command), policy_message=policy_message, owner_id=owner if preview else owner or str(uuid.uuid4()), command_kind=info['kind'], build_state=args.build_state, allow_test_run=int(info['executes_tests']), allow_retry=int(args.allow_retry),
                   estimate_basis='explicit hint' if args.estimate is not None else 'command-class prior',
                   id='preview' if preview else uuid.uuid4().hex, command=json.dumps(command), cwd=cwd,
                   environment=json.dumps(env), signature=signature, status='queued', submitted=time.time(),
@@ -542,7 +546,8 @@ def plan_submission(db, values):
         reason = runtime['admission_reason']
     fields = ('planned_order', 'planned_wave', 'planned_start_in_seconds', 'planned_finish_in_seconds')
     return dict(preview=True, enqueued=False, policy=validate_policy(json.loads(values['command']), db), owner_id=values['owner_id'],
-                command=json.loads(values['command']), cwd=values['cwd'],
+                command=json.loads(values['command']), requested_command=json.loads(values['requested_command']),
+                policy_message=values['policy_message'], cwd=values['cwd'],
                 command_kind=values['command_kind'], estimate=values['estimate'],
                 estimate_source='recent successful runs' if values['samples'] else values['estimate_basis'],
                 samples=values['samples'], cpu_slots=values['cpu_slots'], memory_mb=values['memory_mb'],

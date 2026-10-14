@@ -141,3 +141,24 @@ def validate_policy(command, db):
     if not decision['allowed']:
         raise ValueError('Command denied by shared policy: ' + decision['reason'] + '. See kyoto.py policy show.')
     return decision
+
+
+def prepare_submission(command, db):
+    """Adapt the compile-only policy without bypassing other command rules."""
+    requested = list(command)
+    policy = read_policy(db)
+    decision = evaluate(requested, policy)
+    rule = next((r for r in policy['rules'] if r['id'] == decision['rule_id']), None)
+    message = None
+    if (not decision['allowed'] and decision['executes_tests'] and rule
+            and rule['action'] == 'require' and rule['scope'] == 'cargo'
+            and rule['parameter'] == 'no-run' and rule['value'] is None):
+        argv = cargo_args(requested)
+        split = argv.index('--') if '--' in argv else len(argv)
+        insertion = len(requested) - len(argv) + split
+        command = requested[:insertion] + ['--no-run'] + requested[insertion:]
+        message = ('Test/benchmark execution is disabled by shared policy; '
+                   'this job compiles only (--no-run). Tests/benchmarks will not run.')
+    else:
+        command = requested
+    return command, validate_policy(command, db), message
