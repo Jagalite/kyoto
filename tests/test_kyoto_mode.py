@@ -108,6 +108,17 @@ class KyotoModeTest(unittest.TestCase):
         p, _ = self.observe(2, [job('a', 20)])
         self.assertEqual(p['max_running'], 0)
 
+    def test_malformed_measured_disk_cannot_enable_partial_or_fallback(self):
+        invalid = host(disk=False)
+        invalid['disk_io'] = {'valid': True, 'state': 'measured',
+                              'devices': {'disk0': {'read_ms': 2}}}
+        for t in range(0, 40, 2):
+            policy, state = self.observe(t, [job('a', t)], host_sample=invalid)
+        self.assertEqual(policy['max_running'], 1)
+        self.assertFalse(state['kyoto']['degraded_optimization'])
+        self.assertFalse(state['hill_climb']['telemetry_complete'])
+        self.assertNotEqual(state['kyoto']['state'], 'fallback')
+
     def test_bad_cpu_observation_cannot_enable_degraded_learning(self):
         bad = host(disk=False)
         bad['cpu_percent'] = float('nan')

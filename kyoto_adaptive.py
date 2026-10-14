@@ -35,12 +35,15 @@ class KyotoController:
     def update(self, config, snapshot, queued, running, now):
         if self.first_sample_at is None and _finite(now):
             self.first_sample_at = now
-        disk_complete = disk_known(snapshot.get('disk_io') or {})
+        disk_info = snapshot.get('disk_io') or {}
+        disk_complete = disk_known(disk_info)
+        disk_absent = (disk_info.get('valid') is False and
+                       disk_info.get('state') == 'unavailable')
         self.ever_measured_disk |= disk_complete
         # Never describe missing disk data as healthy. Degraded scoring is
         # allowed only when no physical disk sample has ever been available in
         # this worker and absence has persisted past initial sensor warmup.
-        partial_disk = (not self.ever_measured_disk and not disk_complete
+        partial_disk = (not self.ever_measured_disk and disk_absent
                         and self.first_sample_at is not None and _finite(now)
                         and now - self.first_sample_at >= FALLBACK_GRACE_SECONDS
                         and host_known(snapshot) and not snapshot.get('disk_pressure'))
@@ -68,7 +71,7 @@ class KyotoController:
         telemetry_pause = hill['admission_paused_for_telemetry']
         fallback = (hill['phase'] == 'unavailable' and not pressure and not paused
                     and not telemetry_pause and bool(snapshot.get('valid')) and _finite(now)
-                    and (disk_complete or not self.ever_measured_disk)
+                    and (disk_complete or (disk_absent and not self.ever_measured_disk))
                     and host_known(snapshot))
         if fallback:
             if self.fallback_since is None:
