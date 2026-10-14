@@ -1,0 +1,15 @@
+scenario,policy,useful_work,change_pct,ci_low_pct,ci_high_pct,pressure_seconds
+finite-control,current,2748.703226,0.0,0.0,0.0,0.0
+finite-control,revalidate180,2402.98868,-12.577369,-14.133504,-10.949105,0.0
+finite-control,hybrid,2520.613404,-8.298088,-10.037274,-6.571564,0.0
+capacity-recovery,current,1143.919846,0.0,0.0,0.0,0.0
+capacity-recovery,revalidate180,1657.610078,44.906139,40.962279,48.690244,0.0
+telemetry-dropout-120s,current,2186.056762,0.0,0.0,0.0,0.0
+telemetry-dropout-120s,pause-missing,2748.365726,25.722523,23.997943,27.338457,0.0
+ram-tight,current,1703.149774,0.0,0.0,0.0,629.25
+ram-tight,envelope,2378.532072,39.654898,29.242072,51.86197,0.0
+ram-overestimate,envelope,1195.333297,-29.816314,-35.0401,-23.693887,0.0
+missing-disk-linear,fallback2,2388.508973,99.819496,99.77886,99.859144,0.0
+missing-disk-serial,fallback2,839.519213,-29.766935,-29.790467,-29.743653,0.0
+linear,window30,5165.363833,-38.484048,-42.430166,-34.582273,0.0
+phase-churn-8,window30,1195.333297,-39.607561,-40.020186,-39.170132,0.0
