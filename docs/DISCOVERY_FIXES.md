@@ -1,7 +1,7 @@
 # Kyoto discovery and handoff fixes
 
 This change addresses reproduced controller defects in the opt-in `kyoto` mode.
-Smart remains the default. There is no queue schema change, no new retry
+Kyoto is the default for new queues; existing implicit-Smart queues retain Smart. There is no queue schema change, no new retry
 permission, and no permission to terminate work merely to conduct an experiment.
 
 ## Implemented changes

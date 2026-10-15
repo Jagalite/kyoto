@@ -71,6 +71,10 @@ def connect(root, *, preview=False):
     db.row_factory = sqlite3.Row
     # Serialize migrations across simultaneous submitters/workers.
     db.execute('BEGIN IMMEDIATE')
+    # Previous implicit-Smart queues keep Smart; only genuinely new queues use Kyoto.
+    previous_queue = db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='jobs'"
+    ).fetchone() is not None
     db.execute('''CREATE TABLE IF NOT EXISTS jobs (
         id TEXT PRIMARY KEY, command TEXT, cwd TEXT, environment TEXT, signature TEXT,
         status TEXT, submitted REAL, started REAL, finished REAL, exit_code INTEGER,
@@ -80,6 +84,9 @@ def connect(root, *, preview=False):
         if name not in existing:
             db.execute(f'ALTER TABLE jobs ADD COLUMN {name} {declaration}')
     db.execute('CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
+    # Persist default at creation time so upgrades cannot silently switch modes.
+    db.execute("INSERT OR IGNORE INTO settings(key, value) VALUES ('mode', ?)",
+               (json.dumps('smart' if previous_queue else 'kyoto'),))
     db.execute('CREATE TABLE IF NOT EXISTS runtime (id INTEGER PRIMARY KEY, value TEXT NOT NULL)')
     db.execute('CREATE TABLE IF NOT EXISTS worker_restart (request_id TEXT PRIMARY KEY, session TEXT NOT NULL, expires REAL NOT NULL)')
     if 'request_id' not in {r[1] for r in db.execute('PRAGMA table_info(worker_restart)')}:

@@ -81,10 +81,12 @@ def config_for(name):
     elif name.startswith('fifo-'):
         config.update(mode='fifo', max_running='auto' if name.endswith('auto') else 8)
     elif name.startswith('smart-fixed-'):
-        config['max_running'] = int(name.rsplit('-', 1)[1])
+        config.update(mode='smart', max_running=int(name.rsplit('-', 1)[1]))
     elif name == 'smart-no-defer':
-        config['auto_defer'] = False
-    elif name != 'smart-auto':
+        config.update(mode='smart', auto_defer=False)
+    elif name == 'smart-auto':
+        config.update(mode='smart')
+    else:
         raise ValueError(name)
     return config
 

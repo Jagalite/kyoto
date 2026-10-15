@@ -4,7 +4,7 @@ Active draining can repay its restart cost when a newly admitted job causes a
 large, persistent throughput regression and waiting for natural completion would
 be expensive. It is **not** a rule that kills every job above a concurrency cap.
 The new policy is an optional supervisor for `kyoto` mode; the hill optimizer
-still does not signal processes. Smart remains the default mode.
+still does not signal processes. Kyoto is the default for new queues; active draining remains explicitly opt-in.
 
 ```sh
 python3 kyoto.py config --mode kyoto --active-drain on

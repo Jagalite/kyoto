@@ -182,7 +182,7 @@ class ActiveDrainTest(unittest.TestCase):
             db=kyoto.connect(Path(root))
             try:
                 db.execute("INSERT INTO jobs(id,status,started) VALUES ('a','running',0)")
-                db.execute("INSERT INTO settings VALUES ('mode','\"kyoto\"')")
+                db.execute("UPDATE settings SET value='\"kyoto\"' WHERE key='mode'")
                 db.execute("INSERT INTO settings VALUES ('active_drain','false')")
                 db.commit()
                 self.assertFalse(kyoto.begin_deferral(db,'a',20,'active drain: test'))

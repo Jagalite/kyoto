@@ -137,6 +137,8 @@ class DeferralTest(unittest.TestCase):
             root = Path(folder)
             db = kyoto.connect(root)
             db.execute("INSERT INTO settings VALUES ('max_running','2')")
+            # Exercise the legacy Smart pressure-deferral path explicitly.
+            db.execute("UPDATE settings SET value='\"smart\"' WHERE key='mode'")
             marker = root/'attempt'
             command = [sys.executable, '-c', "from pathlib import Path; import time; p=Path(" + repr(str(marker)) + "); old=p.exists(); p.write_text('retry' if old else 'first'); time.sleep(0 if old else 20)"]
             db.execute('''INSERT INTO jobs(id,command,cwd,environment,status,submitted,estimate,samples,resources,allow_retry)

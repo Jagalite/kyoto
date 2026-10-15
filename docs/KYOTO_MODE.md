@@ -1,12 +1,13 @@
 # Kyoto mode: unified queue routing and adaptive concurrency
 
-`kyoto` is an **opt-in production scheduling mode** which combines Smart's
+`kyoto` is the **default scheduling mode for newly initialized queues** which combines Smart's
 queue ordering / short-job preference / eligible preemption with measured
 progress-driven concurrency adjustment. It is **one persistent controller**,
 not a timer that lets Smart fill every slot and later switches to hill climbing.
-It is still a candidate for the default, **not the default** (Smart remains the
-default until real build/hardware and workload-mix qualification supports a
-change).
+Existing queues retain their previously selected mode, including legacy
+queues whose unpersisted default was Smart. This is a default-selection decision,
+not a claim of universal optimality across hardware. Optimization-triggered
+active draining remains **off by default**.
 
 ```sh
 python3 kyoto.py config --mode kyoto --max-running auto

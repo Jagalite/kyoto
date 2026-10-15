@@ -76,7 +76,7 @@ class QueueTest(unittest.TestCase):
         return json.loads(self.cli('submit', *options, '--', sys.executable, '-c', code).stdout)['id']
 
     def test_smart_reorders_and_reports_forecast(self):
-        config = json.loads(self.cli('config', '--pause').stdout)
+        config = json.loads(self.cli('config', '--mode', 'smart', '--pause').stdout)
         self.assertEqual(config['mode'], 'smart')
         self.assertEqual(config['max_running'], 'auto')
         big = self.submit_with('import time; time.sleep(.15)', '--estimate', '30')
@@ -89,7 +89,7 @@ class QueueTest(unittest.TestCase):
         self.assertIn('shortest', b['scheduling_reason'])
 
     def test_same_directory_commands_run_in_parallel_without_inferred_locks(self):
-        self.cli('config', '--max-running', '2', '--pause')
+        self.cli('config', '--mode', 'smart', '--max-running', '2', '--pause')
         a = self.submit('import time; time.sleep(1)')
         b = self.submit('import time; time.sleep(1)')
         self.cli('config', '--resume')

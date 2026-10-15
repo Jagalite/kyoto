@@ -25,7 +25,7 @@ kyoto.worker(Path(sys.argv[2]))
 
 class ActiveDrainIntegrationTest(integration.HillIntegrationTest):
     test_command_progress_reaches_public_status_and_worker_measurements = None
-    test_default_mode_and_live_mode_switch_reset_experiment = None
+    test_explicit_smart_mode_and_live_mode_switch_reset_experiment = None
     test_delayed_replacement_progress_preserves_learned_limit = None
     test_hill_growth_obeys_numeric_cap_and_explicit_resource_locks = None
     test_recovery_preserves_command_and_rebaselines_old_log_progress = None

@@ -3,7 +3,7 @@
 The `hill-climb` scheduler now uses the production implementation in
 [`hill_climbing.py`](../hill_climbing.py) and [`hill_telemetry.py`](../hill_telemetry.py).
 The research adapters under `experiments/adaptive_research/` are not loaded by
-the worker. Smart remains the default; an existing hill-climb queue receives the
+the worker. Kyoto is the default for new queues; an existing hill-climb queue receives the
 new behavior when its worker loads the updated source.
 
 ## Algorithm selected from the research
