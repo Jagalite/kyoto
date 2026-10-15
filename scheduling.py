@@ -10,7 +10,7 @@ import sys
 DEFAULT_CONFIG = {
     'mode': 'smart', 'max_running': 'auto', 'cpu_budget': os.cpu_count() or 1,
     'memory_budget_mb': 0, 'aging_seconds': 300,
-    'min_available_memory_mb': 0, 'pressure_aware': True, 'auto_defer': True,
+    'min_available_memory_mb': 0, 'pressure_aware': True, 'auto_defer': True, 'active_drain': False,
 }
 
 

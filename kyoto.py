@@ -21,6 +21,7 @@ from commands import PRIORS
 from command_policy import initialize as initialize_policy, preset as policy_preset, read_policy, validate_policy, prepare_submission, parameter as policy_parameter
 from progress import job_progress, ProgressTracker
 from deferral import DeferralController, COOLDOWN_SECONDS, RELIEF_SECONDS
+from active_draining import ActiveDrainController, ACTION_INTERVAL_SECONDS
 from preemption import choose_preemption
 from pressure import AdaptiveController, SAMPLE_SECONDS, sample_host
 
@@ -172,6 +173,13 @@ def begin_deferral(db, job_id, now, reason='sustained memory/swap pressure', pre
         if row is None or row['cancel'] or row['status'] != 'running' or row['deferring']:
             db.rollback()
             return False
+        if reason.startswith('active drain:'):
+            current = config_for(db)
+            if (current.get('mode') != 'kyoto' or current.get('active_drain') is not True
+                    or not current.get('auto_defer', True) or not current.get('pressure_aware', True)
+                    or current.get('paused') or row['deferral_count'] != 0):
+                db.rollback()
+                return False
         if preempt_for is not None:
             target = db.execute("SELECT 1 FROM jobs WHERE id=? AND status='queued' AND cancel=0 AND not_before<=?", (preempt_for, now)).fetchone()
             if not target or config_for(db).get('paused'):
@@ -269,6 +277,10 @@ def worker(root):
         controller = AdaptiveController()
         progress_tracker = ProgressTracker()
         deferrer = DeferralController()
+        active_drainer = ActiveDrainController()
+        last_active_drain = db.execute("SELECT MAX(requested) FROM deferred_attempts WHERE reason LIKE 'active drain:%'").fetchone()[0]
+        if last_active_drain is not None:
+            active_drainer.next_action = time.monotonic() + max(0, last_active_drain + ACTION_INTERVAL_SECONDS - time.time())
         next_preemption = 0
         last_deferral = db.execute('SELECT MAX(requested) FROM deferred_attempts').fetchone()[0]
         if last_deferral is not None:
@@ -330,6 +342,7 @@ def worker(root):
                 pressure_snapshot['supports_restart'] = True
                 pressure_snapshot['supports_hill_climb'] = True
                 pressure_snapshot['supports_kyoto'] = True
+                pressure_snapshot['active_drain'] = dict(active_drainer.diagnostics)
                 pressure_snapshot['signal_errors'] = {job_id: state['signal_error'] for job_id, state in active.items()
                                                       if state.get('signal_error')}
                 pressure_snapshot['recovery_ready'] = recovery_ready
@@ -382,6 +395,11 @@ def worker(root):
                         candidate, waiting = decision
                         preempt_for = waiting['id']
                         reason = 'yielding to short job ' + preempt_for
+                if candidate is None:
+                    candidate = active_drainer.choose(config, pressure_snapshot, running,
+                        time.monotonic(), time.time(), eligible)
+                    if candidate is not None:
+                        reason = candidate['active_drain_reason']
                 if candidate and begin_deferral(db, candidate['id'], now, reason, preempt_for):
                     next_preemption = time.monotonic() + RELIEF_SECONDS
                     state = active[candidate['id']]
@@ -731,6 +749,8 @@ def main():
     configure.add_argument('--mode', choices=['fifo', 'smart', 'hill-climb', 'kyoto'], help='kyoto combines Smart queue routing with measured adaptive concurrency')
     configure.add_argument('--max-running', type=concurrency_limit, help='Positive integer or auto; concurrency ceiling in hill-climb and kyoto modes')
     configure.add_argument('--pressure-aware', choices=['on', 'off'], help='Gate new starts on memory, swap, and disk pressure')
+    configure.add_argument('--active-drain', choices=['on', 'off'],
+        help='Cost-gated rollback of a rejected Kyoto probe; requires auto-defer and pressure-aware (default off)')
     configure.add_argument('--auto-defer', choices=['on', 'off'], help='Stop and requeue eligible builds for sustained pressure or short-job priority (default on)')
     configure.add_argument('--cpu-budget', type=positive_int)
     configure.add_argument('--memory-budget-mb', type=nonnegative_float, help='Deprecated compatibility option; no admission effect')
@@ -836,7 +856,7 @@ def main():
         print(json.dumps(result))
     elif args.action == 'config':
         updates = {key: getattr(args, key) for key in DEFAULT_CONFIG if getattr(args, key) is not None}
-        for key in ('pressure_aware', 'auto_defer'):
+        for key in ('pressure_aware', 'auto_defer', 'active_drain'):
             if key in updates:
                 updates[key] = updates[key] == 'on'
         if args.pause or args.resume:

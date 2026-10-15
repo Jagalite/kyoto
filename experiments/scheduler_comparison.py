@@ -17,6 +17,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+from active_draining import ActiveDrainController
 from pressure import AdaptiveController
 from deferral import DeferralController, COOLDOWN_SECONDS, RELIEF_SECONDS
 from preemption import choose_preemption
@@ -200,6 +201,7 @@ def simulate(settings, policy_name, seed, *, seconds=1200, step=.5, original_fac
         raise ValueError('step must divide both two seconds and the horizon')
     config = config_for(policy_name)
     config['cpu_budget'] = settings.get('cpu_budget', 8)
+    config['active_drain'] = settings.get('active_drain', False)
     if policy_name == 'kyoto-no-defer':
         config.update(mode='kyoto', auto_defer=False)
     if settings.get('auto_defer') is False:
@@ -214,13 +216,14 @@ def simulate(settings, policy_name, seed, *, seconds=1200, step=.5, original_fac
         controller.hill_climber = original_factory()
     publish_result = getattr(controller, 'observe_result', lambda job, now: None)
     deferrer, telemetry = DeferralController(), Telemetry(settings)
+    active_drainer = ActiveDrainController()
     all_jobs = jobs_for(settings, seed, seconds)
     future = sorted(all_jobs, key=lambda j: (j['submitted'], j['id']))
     queued, active, events, samples = [], [], [], []
     policy = dict(config, max_running=1)
     snapshot = {}
     physical = wasted = pressure_seconds = mismatch_seconds = 0.
-    preemptions = deferrals = 0
+    preemptions = deferrals = active_drains = 0
     next_preemption = 0.
     noise_rng = random.Random(seed+10000)
     noise = 1.
@@ -258,6 +261,7 @@ def simulate(settings, policy_name, seed, *, seconds=1200, step=.5, original_fac
                 job['progress'] = progress_for(job, settings, now)
             env = environment(settings, active, now)
             policy, snapshot = controller.update(config, telemetry.sample(settings, env, now), queued, active, now)
+            snapshot['job_progress'] = {j['id']: j.get('progress', {}) for j in active}
         # Terminal build failures are not retried automatically. Failures never count as successes.
         if settings.get('failure_modulo'):
             for job in list(active):
@@ -293,12 +297,18 @@ def simulate(settings, policy_name, seed, *, seconds=1200, step=.5, original_fac
                 if choice:
                     victim, beneficiary = choice
                     cause = 'short-job'
+            if victim is None:
+                proposed = active_drainer.choose(config, snapshot, active, now, now, eligible)
+                if proposed is not None:
+                    victim = next(j for j in active if j['id'] == proposed['id'])
+                    cause = 'active-drain'
             if victim is not None:
-                victim.update(deferring=True, deferral_count=victim.get('deferral_count', 0)+1, stop_at=now+1,
+                victim.update(deferring=True, deferral_count=victim.get('deferral_count', 0)+1, stop_at=now+settings.get('termination_delay', 1),
                               preempt_for=beneficiary['id'] if beneficiary else None)
                 next_preemption = now+RELIEF_SECONDS
                 preemptions += cause == 'short-job'
                 deferrals += cause == 'pressure'
+                active_drains += cause == 'active-drain'
                 events.append(dict(at=now, cause=cause, victim=victim['id'],
                                    beneficiary=beneficiary['id'] if beneficiary else None, work=victim['work']))
         if not any(j['deferring'] for j in active):
@@ -338,7 +348,7 @@ def simulate(settings, policy_name, seed, *, seconds=1200, step=.5, original_fac
         completed_mean_flow=statistics.mean(j['finished']-j['submitted'] for j in completed) if completed else None,
         makespan=max(j['finished'] for j in completed) if not unfinished else None,
         pressure_seconds=pressure_seconds, excess_running_seconds=mismatch_seconds,
-        preemptions=preemptions, pressure_deferrals=deferrals, actual_final=len(active), target_final=policy['max_running'])
+        preemptions=preemptions, pressure_deferrals=deferrals, active_drains=active_drains, actual_final=len(active), target_final=policy['max_running'])
     for label, cohort in (('short', [j for j in arrived if j['total_work'] < 600]),
                           ('long', [j for j in arrived if j['total_work'] >= 600])):
         summary[label+'_restricted_mean_flow'] = (statistics.mean(

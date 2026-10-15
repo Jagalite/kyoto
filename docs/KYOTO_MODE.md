@@ -157,3 +157,11 @@ Rollback is explicit, no schema changes:
 python3 kyoto.py config --mode smart --max-running auto
 python3 kyoto.py restart
 ```
+
+## Optional cost-gated active draining
+
+`--active-drain on` permits a separate supervisor to request termination/requeue
+of the single newcomer from a rejected upward probe, after fresh corroboration
+and an explicit restart-cost gate. It defaults off, requires auto-deferral and
+complete telemetry, and does not enforce arbitrary lowered targets by killing
+jobs. See [the active-draining contract, research, and counterexample](ACTIVE_DRAINING.md).

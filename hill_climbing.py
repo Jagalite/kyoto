@@ -12,6 +12,7 @@ work units have equal value. Rejected trials lead to a stable holding limit.
 Attempts, sources, phases, counter resets, and unexpected cohort changes invalidate
 comparisons. Reducing the target only withholds starts: existing work drains.
 """
+from active_draining import rejection_evidence
 from collections import deque
 import math
 from progress_objective import measure_progress
@@ -96,6 +97,7 @@ class HillClimbingController:
         # existing decision contract for comparisons and compatibility.
         self.scale_aware = bool(scale_aware)
         self.productive_observations = 0
+        self.rejected_upward_probe = None
         self.handoff_check_up = False
         self.telemetry_pause = TelemetryPause(telemetry_grace_seconds)
         self.last_measurements = {}
@@ -126,6 +128,7 @@ class HillClimbingController:
         self.decisions.append(dict(at=now, action=action, target=self.target, reason=reason, **details))
 
     def _reset(self, now, reason, target=1, phase='baseline'):
+        self.rejected_upward_probe = None
         self.handoff_check_up = False
         self.telemetry_pause.reset()
         self.last_measurements = {}
@@ -150,6 +153,7 @@ class HillClimbingController:
             self._decision(now, 'reset', reason)
 
     def _abort(self, now, reason):
+        self.rejected_upward_probe = None
         # An inconclusive downward trial must not admit replacement work while
         # draining. Its lower target is conservative until it can be remeasured.
         self.target = min(self.target, self.probe['from_target'])
@@ -209,6 +213,7 @@ class HillClimbingController:
         return observation, False
 
     def _begin_probe(self, now, observation, direction):
+        self.rejected_upward_probe = None
         self.probe = dict(direction=direction, baseline=observation, from_target=self.target,
                           started=now, observing_at=None, cohort=None, attempts=None,
                           recent=observation['measurements'])
@@ -278,6 +283,8 @@ class HillClimbingController:
             self.target = probe['from_target']
             if probe['direction'] == 'up':
                 self.rejected_limit = self.target + 1
+        self.rejected_upward_probe = (rejection_evidence(probe, observation, self.target, now)
+                                       if not accepted else None)
         if accepted:
             self.qualified_target = self.target
         self.holding = not accepted
@@ -404,6 +411,7 @@ class HillClimbingController:
                             phase=self.phase, reason=self.reason,
                             productive_observations=self.productive_observations,
                             scale_aware=self.scale_aware,
+                            rejected_upward_probe=self.rejected_upward_probe,
                             objective=self.objective, objective_kind='aggregate phase completion per second',
                             coverage=coverage, measurable_jobs=len(measurements), running_jobs=len(running),
                             scoring_coverage=scoring_coverage, actual_running=len(running),
