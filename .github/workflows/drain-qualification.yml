@@ -20,14 +20,22 @@ jobs:
         include:
           - os: macos-latest
             case: shared
+            seconds: 420
+            repeats: 1
           - os: macos-latest
             case: scalable
+            seconds: 120
+            repeats: 2
           - os: macos-latest
             case: recovery
+            seconds: 420
+            repeats: 1
           - os: ubuntu-latest
             case: shared
+            seconds: 120
+            repeats: 2
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 18
+    timeout-minutes: 22
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -36,7 +44,7 @@ jobs:
         with:
           python-version: '3.13'
       - name: Paired enabled versus disabled, real host telemetry
-        run: python experiments/native_drain_qualification.py --case ${{ matrix.case }} --seconds 120 --repeats 2 --budget 2 --output qualification/drain.json
+        run: python experiments/native_drain_qualification.py --case ${{ matrix.case }} --seconds ${{ matrix.seconds }} --repeats ${{ matrix.repeats }} --budget 2 --output qualification/drain.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:

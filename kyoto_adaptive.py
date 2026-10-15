@@ -35,6 +35,10 @@ class KyotoController:
 
     def observe_result(self, job, now):
         self.short_jobs.observe_result(job, now)
+        self.hill.drain_revalidation.result(job, now)
+
+    def observe_active_drain(self, job, now):
+        self.hill.drain_revalidation.committed(self.hill.rejected_upward_probe, job, now)
 
     def _clear_discovery(self):
         self.fallback_since = self.last_fallback_increase = None

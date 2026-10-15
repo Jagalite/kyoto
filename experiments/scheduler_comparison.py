@@ -229,6 +229,7 @@ def simulate(settings, policy_name, seed, *, seconds=1200, step=.5, original_fac
     next_preemption = 0.
     noise_rng = random.Random(seed+10000)
     noise = 1.
+    noise_state = 0.
     max_actual = 0
     time_optimal = 0.
     failures = 0
@@ -258,7 +259,14 @@ def simulate(settings, policy_name, seed, *, seconds=1200, step=.5, original_fac
             queued.append(future.pop(0))
         sampled = tick % round(2/step) == 0
         if sampled:
-            noise = noise_rng.uniform(1-settings.get('noise', 0), 1+settings.get('noise', 0))
+            if settings.get('noise_rho') is not None:
+                rho=settings['noise_rho']; cv=settings.get('noise',0)
+                if not 0<=rho<1 or cv<0:raise ValueError('invalid correlated noise')
+                noise_state=rho*noise_state+math.sqrt(1-rho*rho)*noise_rng.gauss(0,1)
+                sigma=math.sqrt(math.log1p(cv*cv))
+                noise=math.exp(sigma*noise_state-.5*sigma*sigma)
+            else:
+                noise = noise_rng.uniform(1-settings.get('noise', 0), 1+settings.get('noise', 0))
             for job in active:
                 job['progress'] = progress_for(job, settings, now)
             env = environment(settings, active, now)
@@ -305,6 +313,8 @@ def simulate(settings, policy_name, seed, *, seconds=1200, step=.5, original_fac
                     victim = next(j for j in active if j['id'] == proposed['id'])
                     cause = 'active-drain'
             if victim is not None:
+                if cause == 'active-drain':
+                    getattr(controller, 'observe_active_drain', lambda job, now: None)(proposed, now)
                 victim.update(deferring=True, deferral_count=victim.get('deferral_count', 0)+1, stop_at=now+settings.get('termination_delay', 1),
                               preempt_for=beneficiary['id'] if beneficiary else None)
                 next_preemption = now+RELIEF_SECONDS
@@ -312,7 +322,8 @@ def simulate(settings, policy_name, seed, *, seconds=1200, step=.5, original_fac
                 deferrals += cause == 'pressure'
                 active_drains += cause == 'active-drain'
                 events.append(dict(at=now, cause=cause, victim=victim['id'],
-                                   beneficiary=beneficiary['id'] if beneficiary else None, work=victim['work']))
+                                   beneficiary=beneficiary['id'] if beneficiary else None, work=victim['work'],
+                                   followup=bool(proposed.get('active_drain_followup')) if cause == 'active-drain' else False))
         if not any(j['deferring'] for j in active):
             while len(active) < policy['max_running']:
                 job, _ = choose_job(queued, active, policy, now)
@@ -334,7 +345,8 @@ def simulate(settings, policy_name, seed, *, seconds=1200, step=.5, original_fac
                 useful_work=sum(j['work'] for j in all_jobs), pressure=snapshot.get('admission_reason'),
                 hill_phase=snapshot.get('hill_climb', {}).get('phase'),
                 kyoto_state=snapshot.get('kyoto', {}).get('state'),
-                decisions=snapshot.get('hill_climb', {}).get('decisions', [])))
+                decisions=snapshot.get('hill_climb', {}).get('decisions', []),
+                drain_revalidation=snapshot.get('hill_climb', {}).get('drain_revalidation')))
     arrived = [j for j in all_jobs if j['submitted'] < seconds]
     completed = [j for j in arrived if j['finished'] is not None]
     unfinished = [j for j in arrived if j['finished'] is None]

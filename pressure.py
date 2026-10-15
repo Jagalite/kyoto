@@ -100,6 +100,10 @@ class AdaptiveController:
         if self.mode == 'kyoto':
             self.kyoto_controller.observe_result(job, now)
 
+    def observe_active_drain(self, job, now):
+        if self.mode == 'kyoto':
+            self.kyoto_controller.observe_active_drain(job, now)
+
     def update(self, config, host, queued, running, now):
         auto = config['max_running'] == 'auto'
         smart_auto = auto and config['mode'] == 'smart'

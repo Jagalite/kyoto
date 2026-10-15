@@ -13,6 +13,7 @@ Attempts, sources, phases, counter resets, and unexpected cohort changes invalid
 comparisons. Reducing the target only withholds starts: existing work drains.
 """
 from active_draining import rejection_evidence
+from drain_revalidation import DrainRevalidation
 from collections import deque
 import math
 from progress_objective import measure_progress
@@ -98,6 +99,7 @@ class HillClimbingController:
         self.scale_aware = bool(scale_aware)
         self.productive_observations = 0
         self.rejected_upward_probe = None
+        self.drain_revalidation = DrainRevalidation()
         self.handoff_check_up = False
         self.telemetry_pause = TelemetryPause(telemetry_grace_seconds)
         self.last_measurements = {}
@@ -128,6 +130,7 @@ class HillClimbingController:
         self.decisions.append(dict(at=now, action=action, target=self.target, reason=reason, **details))
 
     def _reset(self, now, reason, target=1, phase='baseline'):
+        self.drain_revalidation.reset(reason)
         self.rejected_upward_probe = None
         self.handoff_check_up = False
         self.telemetry_pause.reset()
@@ -153,6 +156,8 @@ class HillClimbingController:
             self._decision(now, 'reset', reason)
 
     def _abort(self, now, reason):
+        if self.probe.get('rollback_revalidation'):
+            self.drain_revalidation.resolved('inconclusive')
         self.rejected_upward_probe = None
         # An inconclusive downward trial must not admit replacement work while
         # draining. Its lower target is conservative until it can be remeasured.
@@ -285,6 +290,16 @@ class HillClimbingController:
                 self.rejected_limit = self.target + 1
         self.rejected_upward_probe = (rejection_evidence(probe, observation, self.target, now)
                                        if not accepted else None)
+        grant = probe.get('rollback_revalidation')
+        if grant:
+            self.drain_revalidation.resolved('accepted' if accepted else 'rejected')
+        if grant and self.rejected_upward_probe:
+            victim = self.rejected_upward_probe['victim']
+            if (not isinstance(grant, dict) or not grant.get('enabled')
+                    or victim[0] != grant.get('victim') or victim[1] == grant.get('previous_attempt')):
+                self.rejected_upward_probe = None
+            else:
+                self.rejected_upward_probe['followup'] = dict(grant)
         if accepted:
             self.qualified_target = self.target
         self.holding = not accepted
@@ -311,10 +326,13 @@ class HillClimbingController:
 
     def update(self, config, snapshot, queued, running, now):
         """Apply progress search *after* AdaptiveController's hard safety gates."""
+        self._current_snapshot = snapshot
         snapshot = dict(snapshot)
         configured = config['cpu_budget'] if config['max_running'] == 'auto' else config['max_running']
         cap = max(1, min(configured, snapshot.get('concurrency_ceiling', configured)))
         measurements = _measurements(running)
+        self.drain_revalidation.observe(config, snapshot, running, measurements,
+                                        now, self.target, self.holding, self.probe)
         coverage = len(measurements) / len(running) if running else 0.
         scoring_coverage = sum(m['total'] is not None for m in measurements.values()) / len(running) if running else 0.
         known, factor, headroom = _resources(snapshot)
@@ -412,6 +430,7 @@ class HillClimbingController:
                             productive_observations=self.productive_observations,
                             scale_aware=self.scale_aware,
                             rejected_upward_probe=self.rejected_upward_probe,
+                            drain_revalidation=dict(self.drain_revalidation.diagnostics),
                             objective=self.objective, objective_kind='aggregate phase completion per second',
                             coverage=coverage, measurable_jobs=len(measurements), running_jobs=len(running),
                             scoring_coverage=scoring_coverage, actual_running=len(running),
@@ -573,8 +592,17 @@ class HillClimbingController:
             direction = 'up' if released else self._changed_workload(observation, domains)
             self.phase = 'hold'
             self.reason = 'holding measured limit; observing for workload changes'
+            if direction is None and self.drain_revalidation.ready(
+                    queued, running, config, self._current_snapshot, now, cap, headroom, self.window_seconds):
+                self._begin_probe(now, observation, 'up')
+                self.probe['rollback_revalidation'] = dict(
+                    self.drain_revalidation.diagnostics['followup_grant'])
+                self._decision(now, 'rollback-revalidation',
+                               'retesting recovered capacity after repaying rollback cost')
+                return
             if direction is None:
                 return
+            self.drain_revalidation.reset('ordinary optimizer exploration resumed')
             self.holding = False
             self.hold_cause = None
             self.rejected_limit = None

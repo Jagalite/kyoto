@@ -43,11 +43,13 @@ def cases():
 def run(task):
     name,settings,seed,active,seconds,step=task
     outcome=simulate(dict(settings,active_drain=active),'kyoto-auto',seed,seconds=seconds,step=step)
-    # The production planner only rolls back a new first attempt. No arbitrary
-    # victims or requeue storms are hidden in aggregate work scores.
+    # Only the original newcomer and one expressly granted follow-up may stop.
+    # No arbitrary victims or requeue storms are hidden in aggregate scores.
     events=[e for e in outcome['events'] if e['cause']=='active-drain']
-    if len({e['victim'] for e in events}) != len(events):
-        raise AssertionError('a logical job was actively drained twice')
+    for victim in {e['victim'] for e in events}:
+        selected=[e for e in events if e['victim']==victim]
+        if len(selected)>2 or (len(selected)==2 and not selected[-1].get('followup')):
+            raise AssertionError('more than one authorized follow-up rollback')
     return dict(scenario=name,seed=seed,active_drain=active,seconds=seconds,step=step,
                 settings=settings,summary=outcome['summary'],events=outcome['events'])
 
@@ -75,7 +77,7 @@ def main():
            for seed in seeds for active in (False,True)]
     args.output.parent.mkdir(parents=True,exist_ok=True)
     metadata=dict(source_sha256={str(p.relative_to(ROOT)):hashlib.sha256(p.read_bytes()).hexdigest()
-        for p in [ROOT/n for n in ('active_draining.py','hill_climbing.py','kyoto.py','kyoto_adaptive.py',
+        for p in [ROOT/n for n in ('active_draining.py','drain_revalidation.py','hill_climbing.py','kyoto.py','kyoto_adaptive.py',
              'pressure.py','scheduling.py','deferral.py','preemption.py','experiments/scheduler_comparison.py')]},
         scope='production policies; synthetic service/resources/signals/retention',runs=len(tasks))
     args.output.with_suffix('.metadata.json').write_text(json.dumps(metadata,indent=2)+'\n')

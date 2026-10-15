@@ -173,7 +173,8 @@ def group_alive(pgid):
         return True
 
 
-def begin_deferral(db, job_id, now, reason='sustained memory/swap pressure', preempt_for=None):
+def begin_deferral(db, job_id, now, reason='sustained memory/swap pressure', preempt_for=None,
+                   drain_request=None):
     db.execute('BEGIN IMMEDIATE')
     try:
         row = db.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone()
@@ -184,7 +185,13 @@ def begin_deferral(db, job_id, now, reason='sustained memory/swap pressure', pre
             current = config_for(db)
             if (current.get('mode') != 'kyoto' or current.get('active_drain') is not True
                     or not current.get('auto_defer', True) or not current.get('pressure_aware', True)
-                    or current.get('paused') or row['deferral_count'] != 0):
+                    or current.get('paused')):
+                db.rollback()
+                return False
+            expected_count = 1 if drain_request and drain_request.get('active_drain_followup') is True else 0
+            if (row['deferral_count'] != expected_count or (drain_request is not None
+                    and (row['attempt_token'] != drain_request.get('attempt_token')
+                         or row['started'] != drain_request.get('started')))):
                 db.rollback()
                 return False
         if preempt_for is not None:
@@ -407,7 +414,10 @@ def worker(root):
                         time.monotonic(), time.time(), eligible)
                     if candidate is not None:
                         reason = candidate['active_drain_reason']
-                if candidate and begin_deferral(db, candidate['id'], now, reason, preempt_for):
+                if candidate and begin_deferral(db, candidate['id'], now, reason, preempt_for,
+                        drain_request=candidate if reason.startswith('active drain:') else None):
+                    if reason.startswith('active drain:'):
+                        controller.observe_active_drain(candidate, time.monotonic())
                     next_preemption = time.monotonic() + RELIEF_SECONDS
                     state = active[candidate['id']]
                     state['deferring'] = True

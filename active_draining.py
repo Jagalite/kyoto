@@ -154,11 +154,18 @@ class ActiveDrainController:
         if not isinstance(victim_key, list) or tuple(victim_key) not in current:
             return self._skip('newcomer identity unavailable')
         victim = next(j for j in running if str(j['id']) == victim_key[0])
-        if (victim['id'] not in eligible_ids or victim.get('deferral_count', 0) != 0
+        grant = evidence.get('followup')
+        followup = (isinstance(grant, dict) and grant.get('enabled') is True
+                    and grant.get('victim') == victim['id']
+                    and isinstance(grant.get('previous_attempt'), str)
+                    and grant['previous_attempt'] != victim.get('attempt_token'))
+        if grant is not None and not followup:
+            return self._skip('invalid follow-up rollback grant')
+        if (victim['id'] not in eligible_ids or victim.get('deferral_count', 0) != (1 if followup else 0)
                 or victim.get('command_kind') in ('test-run', 'bench-run')
                 or not (victim.get('command_kind') in SAFE_KINDS or victim.get('allow_retry'))
                 or not victim.get('attempt_token') or not finite(victim.get('started'))):
-            return self._skip('newcomer is not a first, retry-eligible owned attempt')
+            return self._skip('newcomer is not an authorized retry-eligible owned attempt')
         from preemption import finishing_soon
         if finishing_soon(victim, wall_now):
             return self._skip('newcomer is expected to finish soon')
@@ -195,6 +202,8 @@ class ActiveDrainController:
         if not finite(remaining) or remaining <= MIN_REMAINING_SECONDS:
             return self._skip('a phase may finish soon; wait for natural progress')
         age = wall_now-victim['started']
+        if followup and (not finite(age) or age > 120):
+            return self._skip('follow-up probe is no longer a bounded young attempt')
         if not finite(age) or age < 0:
             return self._skip('invalid attempt age')
         horizon = min(MAX_HORIZON_SECONDS, .5*remaining)
@@ -203,14 +212,23 @@ class ActiveDrainController:
         # and both termination and retry cooldown. No predicted cache credit.
         redo = current[tuple(victim_key)]['value']/current[tuple(victim_key)]['total']/before
         cost = max(age, redo)+TERMINATION_SECONDS+COOLDOWN_SECONDS
-        if not all(finite(v) for v in (gain, cost, horizon)) or gain <= COST_MARGIN*cost:
-            return self._skip('estimated benefit does not cover conservative restart cost')
+        if not all(finite(v) for v in (gain, cost, horizon)):
+            return self._skip('nonfinite decision pricing')
+        pricing = dict(estimated_gain_seconds=gain, charged_cost_seconds=cost,
+            estimated_wait_loss_seconds=(1-proof['worst_ratio'])*horizon,
+            break_even_horizon_seconds=COST_MARGIN*cost/(BENEFIT_DISCOUNT*(1-proof['worst_ratio'])),
+            horizon_seconds=horizon, cache_credit=0, target=target)
+        if not all(finite(v) for v in pricing.values()):
+            return self._skip('nonfinite decision pricing')
+        if gain <= COST_MARGIN*cost:
+            self._skip('estimated benefit does not cover conservative restart cost')
+            self.diagnostics.update(pricing)
+            return None
         self.consumed = True
         self.proof = None
         self.next_action = now+ACTION_INTERVAL_SECONDS
         self.diagnostics = dict(state='selected', reason='cost-qualified rejected-probe rollback',
-            victim=victim['id'], estimated_gain_seconds=gain, charged_cost_seconds=cost,
-            horizon_seconds=horizon, cache_credit=0, target=target)
-        return dict(victim, active_drain_reason=(
-            'active drain: rejected upward probe; estimated gain %.1fs > %.1fx charged cost %.1fs'
-            % (gain, COST_MARGIN, cost)))
+            victim=victim['id'], **pricing)
+        return dict(victim, active_drain_cost_seconds=cost, active_drain_followup=followup, active_drain_reason=(
+            'active drain: %s; estimated gain %.1fs > %.1fx charged cost %.1fs'
+            % ('revalidation rollback' if followup else 'rejected upward probe', gain, COST_MARGIN, cost)))
