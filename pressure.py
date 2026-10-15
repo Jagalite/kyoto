@@ -95,6 +95,11 @@ class AdaptiveController:
         self.kyoto_controller = KyotoController()
         self.mode = None
 
+    def observe_result(self, job, now):
+        """Consume a terminal result once, after the executor has persisted it."""
+        if self.mode == 'kyoto':
+            self.kyoto_controller.observe_result(job, now)
+
     def update(self, config, host, queued, running, now):
         auto = config['max_running'] == 'auto'
         smart_auto = auto and config['mode'] == 'smart'

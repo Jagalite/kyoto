@@ -359,6 +359,10 @@ def worker(root):
                         db.execute('UPDATE jobs SET deferring=0 WHERE id=?', (job_id,))
                         db.execute("UPDATE deferred_attempts SET finished=?, reason=reason || '; command outcome unknown' WHERE job_id=? AND finished IS NULL", (time.time(), job_id))
                         db.commit()
+                    # Use only durable terminal outcomes, never disappearance
+                    # from a sampled cohort or a counter reaching 100 percent.
+                    completed = db.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone()
+                    controller.observe_result(dict(completed), time.monotonic())
                     del active[job_id]
                     continue
                 if state['cancelled'] or state.get('deferring'):
@@ -460,16 +464,28 @@ def recover_existing(root, timeout=5):
         return True
     ensure_worker(root)
     deadline = time.monotonic() + timeout
-    db = sqlite3.connect(root / 'queue.sqlite', timeout=.2)
+    db = sqlite3.connect(root / 'queue.sqlite', timeout=0)
     try:
         while True:
-            row = db.execute('SELECT value FROM runtime WHERE id=1').fetchone()
-            runtime = json.loads(row[0]) if row else {}
-            if worker_ready(root, runtime):
-                return True
-            if time.monotonic() >= deadline:
+            # A recovery/migration lock is temporary, not proof that the
+            # worker failed. Keep the same readiness deadline; never report
+            # the last saved runtime as current while its read is blocked.
+            try:
+                row = db.execute('SELECT value FROM runtime WHERE id=1').fetchone()
+                runtime = json.loads(row[0]) if row else {}
+                if worker_ready(root, runtime):
+                    return True
+            except sqlite3.OperationalError as exc:
+                code = getattr(exc, 'sqlite_errorcode', None)
+                busy = ((code & 255) in (5, 6) if isinstance(code, int) else
+                        str(exc) in ('database is locked', 'database table is locked',
+                                     'database schema is locked'))
+                if not busy:
+                    raise
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 return False
-            time.sleep(.1)
+            time.sleep(min(.1, remaining))
     finally:
         db.close()
 

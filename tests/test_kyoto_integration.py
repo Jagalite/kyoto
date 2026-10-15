@@ -1,5 +1,6 @@
 """Real CLI, worker and runner execution for the Kyoto scheduling mode."""
 import unittest
+import sys
 
 import test_hill_integration as integration
 
@@ -55,6 +56,37 @@ class KyotoWorkerTest(integration.HillIntegrationTest):
         self.assertIn('kyoto', self.runtime())
         self.release('active')
         self.finished(active)
+
+    def finite_batch(self, *, final_counter=False, fail=False):
+        self.configure('--mode', 'kyoto', '--max-running', '4')
+        ids=[]
+        code="import time; time.sleep(.4)"
+        if final_counter:
+            code += "; print('KYOTO_PROGRESS {\"completed\":1,\"total\":1}',flush=True)"
+        if fail:code += "; raise SystemExit(7)"
+        for i in range(12):
+            ids.append(self.cli('submit','--resource',str(self.root / str(i)),
+                                '--',sys.executable,'-u','-c',code)['id'])
+        self.configure('--resume')
+        self.wait_for(lambda: all(self.row(j)['status'] not in ('queued','running') for j in ids),
+                      'finite short batch',timeout=15)
+        rows=[self.row(j) for j in ids]
+        self.assertTrue(all(r['status']==('failed' if fail else 'succeeded') for r in rows))
+        events=[(r['started'],1) for r in rows]+[(r['finished'],-1) for r in rows]
+        actual=maximum=0
+        for _,change in sorted(events):
+            actual+=change;maximum=max(actual,maximum)
+        self.assertLessEqual(maximum,4)
+        return maximum
+
+    def test_silent_successful_completions_enable_real_parallel_discovery(self):
+        self.assertGreaterEqual(self.finite_batch(),2)
+
+    def test_counter_only_at_completion_does_not_reset_discovery(self):
+        self.assertGreaterEqual(self.finite_batch(final_counter=True),2)
+
+    def test_failed_jobs_do_not_supply_fast_discovery_evidence(self):
+        self.assertEqual(self.finite_batch(fail=True),1)
 
 
 if __name__ == '__main__':

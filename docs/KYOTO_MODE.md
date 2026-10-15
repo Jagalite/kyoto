@@ -27,7 +27,7 @@ episode. With a running worker, reload installed code using `kyoto.py restart`.
 | Job ordering | Smart routing: measured short estimates, beneficiary reservations, resource locks, aging and ordinary queue selection |
 | Short-job latency | Eligible safe preemption, including recovery from an extra occupied experimental slot |
 | Concurrency | Production progress-based hill controller when enough valid measurements exist |
-| Incomplete or unknown progress | Bounded, load-aware fallback with **at most three** simultaneous admissions (also capped by configured limit) |
+| Incomplete or unknown progress | Opaque/long-work fallback is capped at three; recent confirmed short successes can enable resource-guided discovery above three, within the configured ceiling |
 | Disk sensor permanently absent since worker startup | Degraded progress optimization after a ten-second warmup using CPU/RAM/swap and actual work counters; **disk telemetry is explicitly marked missing**, not treated as healthy |
 | Previously functioning disk sensor goes missing | Existing conservative admission pause, then one-slot fallback if it persists; not eligible for degraded optimization |
 | Host RAM/swap/disk pressure | Existing host safety gates and the pressure-deferral controller |
@@ -36,14 +36,14 @@ episode. With a running worker, reload installed code using `kyoto.py restart`.
 ### State transitions
 
 The public `health.runtime.kyoto.state` is `discovery`, `optimization`,
-`degraded-optimization`, `fallback`, `observation-pause`, `sensor-unavailable`,
+`degraded-optimization`, `fallback`, `short-discovery`, `observation-pause`, `sensor-unavailable`,
 or `protection`. The `hill_climb` diagnostics remain available and include
 actual vs target concurrency, measurements, decisions, and telemetry quality.
 `health.runtime.kyoto.learned_limit` is the **qualified** hill-climb limit;
 fallback slots are never misreported as a proven optimizer result.
 
 Discovery begins with one job. With complete comparable progress and telemetry,
-Kyoto uses the existing controller's adjacent one-slot trials, thresholds,
+Kyoto uses adjacent one-slot trials, scale-aware upward margins,
 incumbent slowdown protection, and natural draining. It does not auto-preempt a
 running build merely because a trial loses. Smart-style job routing stays
 active throughout, so there is no Smart-to-Hill bulk admission handoff.
@@ -57,7 +57,8 @@ handled as an outage instead of switching to degraded discovery. Pressure and
 hard configured caps always take precedence.
 
 When known progress totals are missing, the optimizer cannot compare normalized
-work. Kyoto increases admission cautiously and stops at **three slots** (or the
+work. For opaque or long jobs without short-success evidence, Kyoto increases
+admission cautiously and stops at **three slots** (or the
 user's smaller maximum); new slots are added no more than once per ten seconds,
 and the CPU/load constraint may limit growth further. Three is a conservative
 unmeasured admission budget, **not a universal optimum**. This mode can beat a
@@ -69,7 +70,31 @@ A switch from fallback back to measured optimization keeps real running jobs
 intact and starts a fresh observation at the current concurrency, preferring a
 downward test rather than automatically admitting another job. It does not
 credit unknown historical progress or kill processes to manufacture a new
-configuration.
+configuration. A single populated counter sample no longer ends discovery: a
+complete productive observation must qualify the handoff. If the first inherited
+downward trial is rejected, Kyoto then explores the previously untested upward
+direction. A successful reduction does not trigger this reversal.
+
+Two recent, non-retried, successful jobs taking at most ten seconds may enable
+`short-discovery`. It requires a homogeneous command/build-state class, no
+long-running incumbent, valid host samples, and conservative CPU/RAM headroom.
+Each increase consumes a new successful-result observation and is separated by
+at least two seconds. Each growth trial must improve observed successful
+completions per elapsed second before further growth; otherwise the previous
+limit is restored and work drains naturally. It can exceed three but never the
+configured/resource ceiling. Counter completion, disappearing processes, failures and cancellations
+are not successful results. A slow or unsuccessful result invalidates the class's
+evidence; pressure, sensor loss, clock discontinuity and worker restart clear it.
+This is a resource-guided prediction, not a guarantee that the next build is short
+or an accepted throughput improvement. Opaque long-work discovery is unchanged.
+
+Kyoto's upward score margin is `min(5%, 0.5 / current_concurrency)`. Gains below the original 5% margin require two separately measured
+agreeing windows before accepting an upward change. These windows are not assumed independent and do not constitute
+a statistical confidence bound. Standalone `hill-climb` retains its original
+5% margin and one-window decision for compatibility and comparison.
+
+See [discovery fixes and qualification](DISCOVERY_FIXES.md) for reproducible
+regressions and the remaining default-promotion blockers.
 
 ### Short-job preemption and correctness
 

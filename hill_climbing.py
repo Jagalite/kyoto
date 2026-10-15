@@ -82,7 +82,8 @@ def _resources(snapshot):
 
 class HillClimbingController:
     def __init__(self, *, window_seconds=None, cooldown_seconds=None,
-                 max_gap_seconds=None, probe_timeout_seconds=None, telemetry_grace_seconds=None):
+                 max_gap_seconds=None, probe_timeout_seconds=None, telemetry_grace_seconds=None,
+                 scale_aware=False):
         self.window_seconds = WINDOW_SECONDS if window_seconds is None else window_seconds
         self.cooldown_seconds = COOLDOWN_SECONDS if cooldown_seconds is None else cooldown_seconds
         self.max_gap_seconds = MAX_GAP_SECONDS if max_gap_seconds is None else max_gap_seconds
@@ -91,6 +92,11 @@ class HillClimbingController:
         if (not all(_finite(value) for value in intervals)
                 or min(intervals[:3]) <= 0 or self.cooldown_seconds < 0):
             raise ValueError('hill climbing intervals must be positive; cooldown may be zero')
+        # Kyoto opts into scale-aware margins; standalone hill-climb keeps its
+        # existing decision contract for comparisons and compatibility.
+        self.scale_aware = bool(scale_aware)
+        self.productive_observations = 0
+        self.handoff_check_up = False
         self.telemetry_pause = TelemetryPause(telemetry_grace_seconds)
         self.last_measurements = {}
         self.qualified_target = 1
@@ -120,6 +126,7 @@ class HillClimbingController:
         self.decisions.append(dict(at=now, action=action, target=self.target, reason=reason, **details))
 
     def _reset(self, now, reason, target=1, phase='baseline'):
+        self.handoff_check_up = False
         self.telemetry_pause.reset()
         self.last_measurements = {}
         self.qualified_target = 1
@@ -189,6 +196,7 @@ class HillClimbingController:
         if elapsed < maximum and any(rate == 0 for rate in rates.values()):
             return None, False
         if result['eligible'] and all(rate > 0 for rate in rates.values()):
+            self.productive_observations += 1
             self.telemetry_pause.qualify()
             if not self.probe and len(rates) == self.target:
                 self.qualified_target = self.target
@@ -210,6 +218,27 @@ class HillClimbingController:
         self._decision(now, 'probe-' + direction,
                        'testing one additional slot' if direction == 'up' else 'waiting for one slot to drain')
 
+    def adopt_limit(self, now, target, reason):
+        """Measure inherited admission without presenting it as a proven gain.
+
+        Test down first. Only an immediate rejection of that first down probe
+        can reopen up: once a reduction wins, the larger limit was measured and
+        must not be tried again merely to bounce between neighboring limits.
+        """
+        self._reset(now, reason, target=target)
+        self.next_probe_at = now
+        self.next_direction = 'down' if target > 1 else 'up'
+        self.handoff_check_up = target > 1
+
+    def _threshold(self, direction, target):
+        if direction == 'down':
+            return DOWN_THRESHOLD
+        if not self.scale_aware:
+            return GAIN_THRESHOLD
+        # Half the ideal marginal gain, capped at the original 5% margin.
+        # This is an explicit policy margin, NOT a statistical confidence level.
+        return 1 + min(GAIN_THRESHOLD - 1, .5 / target)
+
     def _finish_probe(self, now, observation):
         probe = self.probe
         baseline = probe['baseline']
@@ -229,9 +258,22 @@ class HillClimbingController:
             self._abort(now, 'progress comparison is nonfinite; new baseline')
             self.objective = None
             return
-        threshold = GAIN_THRESHOLD if probe['direction'] == 'up' else DOWN_THRESHOLD
+        threshold = self._threshold(probe['direction'], probe['from_target'])
         accepted = positive and min(ratios) >= .25 and objective >= threshold
+        # Gains below the original margin need two separately
+        # measured, agreeing windows. They are not assumed independent and do
+        # not establish a confidence bound. A regression rejects immediately.
+        confirmations = 2 if (self.scale_aware and probe['direction'] == 'up'
+                              and objective < GAIN_THRESHOLD) else 1
+        if accepted:
+            probe['positive_windows'] = probe.get('positive_windows', 0) + 1
+            if probe['positive_windows'] < confirmations:
+                self.objective = objective
+                self.reason = 'confirming small marginal gain in a fresh window'
+                return
         self.objective = objective
+        check_up = self.handoff_check_up and probe['direction'] == 'down' and not accepted
+        self.handoff_check_up = False
         if not accepted:
             self.target = probe['from_target']
             if probe['direction'] == 'up':
@@ -240,7 +282,10 @@ class HillClimbingController:
             self.qualified_target = self.target
         self.holding = not accepted
         self.hold_cause = 'rejected' if self.holding else None
-        self.next_direction = probe['direction']
+        self.next_direction = 'up' if check_up else probe['direction']
+        if check_up:
+            self.holding = False
+            self.hold_cause = None
         reference = observation if accepted else baseline
         self.reference_rates = dict(reference['normalized_rates'])
         self.change_work = self.change_expected = self.change_seconds = 0.
@@ -253,7 +298,9 @@ class HillClimbingController:
                        'progress supports ' + str(self.target) + ' slots' if accepted else 'probe did not improve progress',
                        direction=probe['direction'], objective=objective, progress_ratio=progress_ratio,
                        progress_per_second=after, baseline_progress_per_second=before,
-                       paired_jobs=len(paired), minimum_job_ratio=min(ratios))
+                       paired_jobs=len(paired), minimum_job_ratio=min(ratios),
+                       threshold=threshold, confirming_windows=probe.get('positive_windows', 0),
+                       check_untested_up=check_up)
 
     def update(self, config, snapshot, queued, running, now):
         """Apply progress search *after* AdaptiveController's hard safety gates."""
@@ -355,6 +402,8 @@ class HillClimbingController:
                         admission_reason=reason, effective_memory_reserve_mb=0, automatic=True,
                         hill_climb=dict(target=self.target, qualified_target=self.qualified_target,
                             phase=self.phase, reason=self.reason,
+                            productive_observations=self.productive_observations,
+                            scale_aware=self.scale_aware,
                             objective=self.objective, objective_kind='aggregate phase completion per second',
                             coverage=coverage, measurable_jobs=len(measurements), running_jobs=len(running),
                             scoring_coverage=scoring_coverage, actual_running=len(running),

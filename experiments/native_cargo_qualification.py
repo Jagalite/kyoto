@@ -42,15 +42,16 @@ def project(path, functions):
         (crate / 'src/lib.rs').write_text('\n'.join(body))
 
 
-def cli(state, env, *args):
-    r = subprocess.run([sys.executable, str(ROOT / 'kyoto.py'), '--state', str(state), *args],
+def cli(state, env, *args, source_root=ROOT):
+    r = subprocess.run([sys.executable, str(source_root / 'kyoto.py'), '--state', str(state), *args],
                        env=env, capture_output=True, text=True, timeout=30)
     if r.returncode:
         raise RuntimeError(f'CLI {args[0]} returned {r.returncode}: {r.stderr[-1000:]}')
     return json.loads(r.stdout)
 
 
-def batch(mode, kind, repeat, budget, jobs, functions, timeout):
+def batch(mode, kind, repeat, budget, jobs, functions, timeout, baseline_root=None):
+    source_root = baseline_root if mode == 'baseline-kyoto' else ROOT
     with tempfile.TemporaryDirectory(prefix='kyoto-native-qualification-') as tmp:
         tmp = Path(tmp)
         env = dict(os.environ, KYOTO_USER_ID=str(uuid.uuid4()), CARGO_NET_OFFLINE='true')
@@ -69,14 +70,14 @@ def batch(mode, kind, repeat, budget, jobs, functions, timeout):
             projects.append(path)
         state = tmp / 'queue'
         db = kyoto.connect(state)
-        name = 'smart' if mode.startswith('fixed-') else mode
+        name = 'smart' if mode.startswith('fixed-') else 'kyoto' if mode == 'baseline-kyoto' else mode
         cap = int(mode.split('-')[1]) if mode.startswith('fixed-') else 'auto'
         settings = dict(mode=name, max_running=cap, cpu_budget=budget, paused=True)
         for key, value in settings.items():
             db.execute('INSERT OR REPLACE INTO settings(key,value) VALUES (?,?)', (key, json.dumps(value)))
         db.commit()
         log = (tmp / 'worker.log').open('w')
-        worker = subprocess.Popen([sys.executable, str(ROOT / 'kyoto.py'), '--state', str(state), '_worker'],
+        worker = subprocess.Popen([sys.executable, str(source_root / 'kyoto.py'), '--state', str(state), '_worker'],
                                   env=env, stdout=log, stderr=log, start_new_session=True)
         ids, samples = [], []
         try:
@@ -93,12 +94,12 @@ def batch(mode, kind, repeat, budget, jobs, functions, timeout):
             for path in projects:
                 ids.append(cli(state, env, 'submit', '--cwd', str(path), '--resource', str(path),
                                '--build-state', 'cold' if kind == 'cold' else 'incremental',
-                               '--', *command)['id'])
+                               '--', *command, source_root=source_root)['id'])
             started = time.monotonic()
-            cli(state, env, 'config', '--resume')
+            cli(state, env, 'config', '--resume', source_root=source_root)
             last_sample = None
             while True:
-                rows = [dict(row) for row in db.execute('SELECT id,status,started,finished,attempt_token FROM jobs')]
+                rows = [dict(row) for row in db.execute('SELECT id,status,started,finished,attempt_token,deferral_count FROM jobs')]
                 runtime = kyoto.runtime_for(db) or {}
                 if runtime.get('sampled_at') != last_sample:
                     last_sample = runtime.get('sampled_at')
@@ -106,6 +107,8 @@ def batch(mode, kind, repeat, budget, jobs, functions, timeout):
                         active=sum(r['status']=='running' for r in rows),
                         limit=runtime.get('effective_max_running'),
                         state=(runtime.get('kyoto') or {}).get('state'),
+                        hill_phase=(runtime.get('hill_climb') or {}).get('phase'),
+                        short_evidence=(runtime.get('kyoto') or {}).get('short_job_evidence'),
                         pressure=runtime.get('pressure'), cpu_percent=runtime.get('cpu_percent')))
                 if len(rows) == jobs and all(r['status'] not in ('queued', 'running') for r in rows):
                     break
@@ -116,7 +119,15 @@ def batch(mode, kind, repeat, budget, jobs, functions, timeout):
                 time.sleep(.1)
             elapsed = time.monotonic()-started
             success = sum(r['status']=='succeeded' for r in rows)
+            overlap = maximum = 0
+            events = [(r['started'], 1) for r in rows if r['started'] is not None]
+            events += [(r['finished'], -1) for r in rows if r['started'] is not None and r['finished'] is not None]
+            for _, change in sorted(events):
+                overlap += change
+                maximum = max(maximum, overlap)
             return dict(mode=mode,kind=kind,repeat=repeat,budget=budget,jobs=jobs,
+                        max_final_attempt_overlap=maximum,
+                        deferrals=sum(r['deferral_count'] or 0 for r in rows),
                         succeeded=success,statuses=[r['status'] for r in rows],seconds=elapsed,
                         max_observed_active=max((s['active'] for s in samples),default=0),
                         samples=samples)
@@ -151,6 +162,8 @@ def main():
     p.add_argument('--budget',type=int,default=4)
     p.add_argument('--timeout',type=float,default=180)
     p.add_argument('--kinds',default='cold,incremental,noop')
+    p.add_argument('--modes',default=None,help='Optional comma-separated modes; baseline-kyoto requires --baseline-root')
+    p.add_argument('--baseline-root',type=Path,default=None,help='Trusted frozen Kyoto source directory')
     a=p.parse_args()
     if not shutil.which('cargo'):
         p.error('Cargo is required; no simulated build substitution is allowed')
@@ -160,6 +173,16 @@ def main():
     if len(set(kinds))!=len(kinds) or any(k not in ('cold','incremental','noop') for k in kinds):
         p.error('invalid or duplicate kinds')
     modes=['smart','kyoto']+[f'fixed-{n}' for n in range(1,a.budget+1)]
+    if a.baseline_root is not None:
+        a.baseline_root=a.baseline_root.resolve()
+        if not (a.baseline_root/'kyoto.py').is_file():
+            p.error('baseline source directory must contain kyoto.py')
+        modes.append('baseline-kyoto')
+    if a.modes:
+        selected=a.modes.split(',')
+        if len(set(selected))!=len(selected) or any(m not in modes for m in selected):
+            p.error('invalid or duplicate modes for this budget')
+        modes=selected
     plan=[(mode,kind,rep) for rep in range(a.repeats) for kind in kinds for mode in modes]
     random.Random(14026).shuffle(plan)
     metadata=dict(platform=platform.platform(),cpu_count=os.cpu_count(),budget=a.budget,
@@ -168,12 +191,15 @@ def main():
         source_sha256={f:hashlib.sha256((ROOT/f).read_bytes()).hexdigest() for f in
             ('kyoto.py','kyoto_adaptive.py','hill_climbing.py','pressure.py','scheduling.py','preemption.py')},
         scope='Real generated offline Cargo builds through real CLI/worker/runners; short synthetic projects, not a representative project corpus',
+        baseline_source_sha256=({f:hashlib.sha256((a.baseline_root/f).read_bytes()).hexdigest() for f in
+            ('kyoto.py','kyoto_adaptive.py','hill_climbing.py','pressure.py','scheduling.py','preemption.py')}
+            if a.baseline_root else None),
         plan=plan,rows=[])
     a.output.parent.mkdir(parents=True,exist_ok=True)
     errors=0
     for mode,kind,rep in plan:
         try:
-            result=batch(mode,kind,rep,a.budget,a.jobs,a.functions,a.timeout)
+            result=batch(mode,kind,rep,a.budget,a.jobs,a.functions,a.timeout,a.baseline_root)
             errors += result['succeeded'] != a.jobs
         except Exception as exc:
             errors+=1

@@ -4,6 +4,10 @@ on:
   pull_request:
     paths:
       - '.github/workflows/sustained-readiness.yml'
+      - 'experiments/native_cargo_qualification.py'
+      - 'short_job_discovery.py'
+      - 'kyoto_adaptive.py'
+      - 'hill_climbing.py'
 
 permissions:
   contents: read
@@ -24,13 +28,18 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
+          fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with:
           python-version: '3.13'
-      - name: Real sustained isolated Cargo batches
+      - name: Extract the frozen pre-fix scheduler
         run: |
-          python experiments/native_cargo_qualification.py --output qualification/cargo.json --budget ${{ matrix.budget }} --jobs 16 --functions 256 --repeats 2 --kinds cold --timeout 180
+          mkdir -p "$RUNNER_TEMP/kyoto-baseline"
+          git archive a9ea4bee27c6863358bad63b6256afa28f4c0602 | tar -x -C "$RUNNER_TEMP/kyoto-baseline"
+      - name: Paired real isolated Cargo batches
+        run: |
+          python experiments/native_cargo_qualification.py --output qualification/cargo.json --budget ${{ matrix.budget }} --jobs 16 --functions 256 --repeats 3 --kinds cold --timeout 180 --baseline-root "$RUNNER_TEMP/kyoto-baseline" --modes smart,kyoto,baseline-kyoto,fixed-${{ matrix.budget }}
       - name: Retain sanitized results only
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
