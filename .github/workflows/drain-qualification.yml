@@ -1,0 +1,46 @@
+name: Enabled active-draining qualification
+on:
+  pull_request:
+    paths:
+      - 'active_draining.py'
+      - 'drain_revalidation.py'
+      - 'experiments/native_drain_qualification.py'
+      - 'experiments/workloads/shared_counter.c'
+      - '.github/workflows/drain-qualification.yml'
+permissions:
+  contents: read
+concurrency:
+  group: enabled-drain-${{ github.sha }}
+  cancel-in-progress: true
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            case: shared
+          - os: macos-latest
+            case: scalable
+          - os: macos-latest
+            case: recovery
+          - os: ubuntu-latest
+            case: shared
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 18
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.13'
+      - name: Paired enabled versus disabled, real host telemetry
+        run: python experiments/native_drain_qualification.py --case ${{ matrix.case }} --seconds 120 --repeats 2 --budget 2 --output qualification/drain.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: enabled-drain-${{ matrix.os }}-${{ matrix.case }}
+          path: qualification/drain.json
+          if-no-files-found: error
+          retention-days: 14
