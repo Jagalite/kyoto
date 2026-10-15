@@ -145,22 +145,38 @@ class QueueTest(unittest.TestCase):
         self.assertTrue(all(self.wait(job)['status'] == 'succeeded' for job in ids))
 
     def test_worker_restart_recovers_running_job_and_exit_status(self):
-        self.cli('config', '--pause', '--max-running', '2')
+        # This is a recovery/parallel-admission test, not a discovery test.
+        # FIFO with an explicit cap guarantees both slots independently of
+        # the default optimizer's initial measurement windows.
+        self.cli('config', '--mode', 'fifo', '--pause', '--max-running', '2')
         marker = Path(self.temp.name) / 'executions'
-        code = f"from pathlib import Path; import time; p=Path({str(marker)!r}); p.open('a').write('once\\n'); time.sleep(3); raise SystemExit(7)"
+        release = Path(self.temp.name) / 'release-recovered'
+        code = f"""from pathlib import Path
+import time
+with Path({str(marker)!r}).open('a') as f: f.write('once\\n')
+deadline=time.monotonic()+30
+while not Path({str(release)!r}).exists():
+    if time.monotonic()>deadline: raise SystemExit(99)
+    time.sleep(.02)
+raise SystemExit(7)
+"""
         first = self.submit(code)
-        self.cli('config', '--resume')
-        deadline = time.monotonic() + 15
-        while not marker.exists():
-            self.assertLess(time.monotonic(), deadline)
-            time.sleep(.05)
-        self.worker.kill()
-        self.worker.wait(timeout=5)
-        self.worker = subprocess.Popen(self.base + ['_worker'], start_new_session=True)
-        second = self.submit('print("next")')
-        b = self.wait(second)
+        try:
+            self.cli('config', '--resume')
+            deadline = time.monotonic() + 15
+            while not marker.exists():
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(.05)
+            self.worker.kill()
+            self.worker.wait(timeout=5)
+            self.worker = subprocess.Popen(self.base + ['_worker'], start_new_session=True)
+            second = self.submit('print("next")')
+            b = self.wait(second)
+            self.assertEqual(b['status'], 'succeeded')
+            self.assertEqual(json.loads(self.cli('show', first).stdout)['status'], 'running')
+        finally:
+            release.touch()
         a = self.wait(first)
-        self.assertEqual(b['status'], 'succeeded')
         self.assertLess(b['finished'], a['finished'])
         self.assertEqual(a['status'], 'failed')
         self.assertEqual(a['exit_code'], 7)

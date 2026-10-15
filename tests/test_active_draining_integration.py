@@ -53,12 +53,17 @@ class ActiveDrainIntegrationTest(integration.HillIntegrationTest):
 '''
             code += '''signal.signal(signal.SIGTERM, stopped)
 if name=='b':Path('b-running').touch()
-x=0
+x=0.
+last=time.monotonic()
 deadline=time.monotonic()+25
 while not Path('release-'+name).exists() and not Path('finish').exists():
-    if time.monotonic()>deadline:raise SystemExit(99)
+    now=time.monotonic()
+    if now>deadline:raise SystemExit(99)
+    # This synthetic service model is wall-time based; scheduler jitter must
+    # not turn the intended persistent regression into an unconfirmed sample.
+    x += (now-last)*25*(20 if Path('b-running').exists() else 100)
+    last=now
     print('KYOTO_PROGRESS '+json.dumps(dict(completed=x,total=1000000,phase='build')),flush=True)
-    x += 20 if Path('b-running').exists() else 100
     time.sleep(.04)
 if name=='b':Path('b-running').unlink(missing_ok=True)
 '''
