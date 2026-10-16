@@ -76,7 +76,7 @@ class ActiveDrainTest(unittest.TestCase):
                 self.assertEqual(len(self.run_until_selected()),1)
 
     def test_default_and_disabled_policies_never_terminate(self):
-        self.assertIs(DEFAULT_CONFIG['active_drain'],False)
+        self.assertIs(DEFAULT_CONFIG['active_drain'],True)
         for change in ({'active_drain':False}, {'auto_defer':False}, {'pressure_aware':False},
                        {'paused':True}, {'mode':'hill-climb'}, {'mode':'smart'}, {'mode':'fifo'}):
             with self.subTest(change=change):
@@ -183,7 +183,7 @@ class ActiveDrainTest(unittest.TestCase):
             try:
                 db.execute("INSERT INTO jobs(id,status,started) VALUES ('a','running',0)")
                 db.execute("UPDATE settings SET value='\"kyoto\"' WHERE key='mode'")
-                db.execute("INSERT INTO settings VALUES ('active_drain','false')")
+                db.execute("UPDATE settings SET value='false' WHERE key='active_drain'")
                 db.commit()
                 self.assertFalse(kyoto.begin_deferral(db,'a',20,'active drain: test'))
                 self.assertEqual(db.execute('SELECT COUNT(*) FROM deferred_attempts').fetchone()[0],0)

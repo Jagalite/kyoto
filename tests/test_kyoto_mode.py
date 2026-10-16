@@ -140,9 +140,9 @@ class KyotoModeTest(unittest.TestCase):
         self.assertIsNone(choose_preemption(c, policy,
             [dict(queued[0], resources=['/one'])], locked, 100, {j['id'] for j in locked}))
 
-    def test_kyoto_is_default_with_opt_in_active_draining(self):
+    def test_kyoto_is_default_with_guarded_active_draining(self):
         self.assertEqual(DEFAULT_CONFIG['mode'], 'kyoto')
-        self.assertIs(DEFAULT_CONFIG['active_drain'], False)
+        self.assertIs(DEFAULT_CONFIG['active_drain'], True)
         c = AdaptiveController()
         self.assertIsNotNone(c.kyoto_controller)
 

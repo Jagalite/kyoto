@@ -7,7 +7,9 @@ not a timer that lets Smart fill every slot and later switches to hill climbing.
 Existing queues retain their previously selected mode, including legacy
 queues whose unpersisted default was Smart. This is a default-selection decision,
 not a claim of universal optimality across hardware. Optimization-triggered
-active draining remains **off by default**.
+active draining is **on by default for new queues**, with its strict retry,
+measurement, cooldown, and cost gates. Existing queues retain their prior
+explicit value or their previously implicit off setting.
 
 ```sh
 python3 kyoto.py config --mode kyoto --max-running auto
@@ -159,10 +161,11 @@ python3 kyoto.py config --mode smart --max-running auto
 python3 kyoto.py restart
 ```
 
-## Optional cost-gated active draining
+## Cost-gated active draining
 
 `--active-drain on` permits a separate supervisor to request termination/requeue
 of the single newcomer from a rejected upward probe, after fresh corroboration
-and an explicit restart-cost gate. It defaults off, requires auto-deferral and
-complete telemetry, and does not enforce arbitrary lowered targets by killing
-jobs. See [the active-draining contract, research, and counterexample](ACTIVE_DRAINING.md).
+and an explicit restart-cost gate. This is enabled for new queues, but existing
+queues preserve their earlier active-drain choice (including implicit off).
+Use `--active-drain off` to disable it. It requires auto-deferral and complete
+telemetry and does not enforce arbitrary lowered targets by killing jobs. See [the active-draining contract, research, and counterexample](ACTIVE_DRAINING.md).
