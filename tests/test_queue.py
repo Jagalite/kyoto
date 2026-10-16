@@ -226,7 +226,9 @@ raise SystemExit(7)
 
     def test_legacy_build_does_not_block_recovery(self):
         import fcntl
-        self.cli('config', '--pause', '--max-running', '2')
+        # This test qualifies process/lock recovery, not adaptive admission.
+        # Reserve the second slot explicitly even when Kyoto is the default.
+        self.cli('config', '--mode', 'fifo', '--pause', '--max-running', '2')
         job = self.submit('import signal; signal.pause()')
         self.worker.terminate()
         self.worker.wait(timeout=5)
