@@ -87,6 +87,12 @@ def connect(root, *, preview=False):
     # Persist default at creation time so upgrades cannot silently switch modes.
     db.execute("INSERT OR IGNORE INTO settings(key, value) VALUES ('mode', ?)",
                (json.dumps('smart' if previous_queue else 'kyoto'),))
+    # Changing the default can terminate a retry-safe build. Preserve all existing
+    # queues' implicit off setting; newly created queues explicitly opt into the
+    # cost-gated rollback policy. Persisting both choices makes future upgrades
+    # stable and leaves explicit on/off settings authoritative.
+    db.execute("INSERT OR IGNORE INTO settings(key, value) VALUES ('active_drain', ?)",
+               (json.dumps(not previous_queue),))
     db.execute('CREATE TABLE IF NOT EXISTS runtime (id INTEGER PRIMARY KEY, value TEXT NOT NULL)')
     db.execute('CREATE TABLE IF NOT EXISTS worker_restart (request_id TEXT PRIMARY KEY, session TEXT NOT NULL, expires REAL NOT NULL)')
     if 'request_id' not in {r[1] for r in db.execute('PRAGMA table_info(worker_restart)')}:
@@ -767,7 +773,7 @@ def main():
     configure.add_argument('--max-running', type=concurrency_limit, help='Positive integer or auto; concurrency ceiling in hill-climb and kyoto modes')
     configure.add_argument('--pressure-aware', choices=['on', 'off'], help='Gate new starts on memory, swap, and disk pressure')
     configure.add_argument('--active-drain', choices=['on', 'off'],
-        help='Cost-gated rollback of a rejected Kyoto probe; requires auto-defer and pressure-aware (default off)')
+        help='Cost-gated rollback of a rejected Kyoto probe; requires auto-defer and pressure-aware (on for new queues; existing settings preserved)')
     configure.add_argument('--auto-defer', choices=['on', 'off'], help='Stop and requeue eligible builds for sustained pressure or short-job priority (default on)')
     configure.add_argument('--cpu-budget', type=positive_int)
     configure.add_argument('--memory-budget-mb', type=nonnegative_float, help='Deprecated compatibility option; no admission effect')

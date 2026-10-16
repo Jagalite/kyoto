@@ -1,6 +1,8 @@
-# Cost-gated active draining and recovery (opt-in)
+# Cost-gated active draining and recovery
 
-Kyoto is the default for new queues. **Active draining is still default-off.**
+Kyoto and its cost-gated active draining are **enabled by default for newly
+initialized queues**. Existing queues retain their saved settings; queues that
+previously had no `active_drain` setting are explicitly migrated to `false`.
 This policy compares the cost of retaining harmful excess concurrency against
 termination and retry cost. It does not treat waiting as free, or kill every job
 above a reduced limit. [Post-drain recovery and current research](DRAIN_REVALIDATION.md)
@@ -9,15 +11,16 @@ The [original no-revalidation study](archive/ACTIVE_DRAINING_v1.md) is preserved
 unchanged as historical evidence, not the current repeat-authority contract.
 
 ```sh
-python3 kyoto.py config --mode kyoto --active-drain on
-python3 kyoto.py config --active-drain off
+python3 kyoto.py config --active-drain off   # Disable new optimization-triggered stops
+python3 kyoto.py config --active-drain on    # Enable for an existing queue
 ```
 
 Both `auto_defer` and `pressure_aware` must be on. Use the existing queue's
 `--state` path; reload updated worker code with `python3 kyoto.py restart`.
 Disabling prevents new requests and recovery probes, not an already committed
-termination. No schema migration, implicit activation or expanded retry permission
-is introduced by this change.
+termination. There is no queue schema change and no expanded retry permission.
+New queues persist `active_drain=true` at creation; existing queues missing that
+setting persist `false`, so upgrading cannot silently activate termination.
 
 ## Eligibility and pricing
 

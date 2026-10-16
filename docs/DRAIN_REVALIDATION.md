@@ -1,7 +1,8 @@
 # Post-drain recovery and bounded revalidation
 
-This completes the rollback lifecycle for the optional `active_drain` policy.
-Kyoto remains the default for new queues; active draining remains default-off.
+This completes the rollback lifecycle for the configurable `active_drain` policy.
+Kyoto and cost-gated draining are defaults for newly created queues; upgrades
+preserve existing queues' active-drain choices, including an implicit off setting.
 The change does not authorize killing arbitrary jobs to enforce a lower cap.
 
 ## Treat acting and waiting as competing costs

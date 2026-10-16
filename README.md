@@ -98,7 +98,10 @@ when disk telemetry has never been available (for example on Linux). Pressure,
 configuration limits, locks, and cancellation remain independent safety gates.
 Existing queues retain their saved mode, including legacy queues where Smart
 was previously implicit. Only newly initialized queues default to Kyoto.
-Active draining remains separately opt-in (`--active-drain on`).
+New queues enable cost-gated active draining by default; existing queues preserve
+their saved or formerly implicit off setting. Disable with `--active-drain off`.
+Only the eligible newcomer from a rejected upward probe may be stopped after
+repeated evidence and restart-cost checks; arbitrary excess jobs drain naturally.
 
 ```sh
 python3 kyoto.py config --mode kyoto --max-running auto
