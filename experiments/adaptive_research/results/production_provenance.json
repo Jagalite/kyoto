@@ -1,0 +1,47 @@
+{
+  "date": "2026-10-14",
+  "scope": "Synthetic controller-boundary comparison; no claim of hardware speedup",
+  "baseline": "337f5fd7dc79e019ce0912c827363228c5c10be8",
+  "production_commit": "94ed2fbf4aa34733b360f6ee622a6d4de3f895b1",
+  "counts": {
+    "main": 1488,
+    "telemetry": 432,
+    "sensitivity": 144,
+    "total": 2064
+  },
+  "production_source_hashes": {
+    "hill_climbing.py": {
+      "sha256": "9e8d39e7f1cd902854c4f7860fd05a008d4fea10939be3fa44399d6ccddc2470",
+      "git_blob": "8968a93a79f76459f673e2ff0be41d13597a62c4"
+    },
+    "hill_telemetry.py": {
+      "sha256": "172abb56b8bda3e88f58f4eb879c117513cd6ef658e75794569da19e1f5f5908",
+      "git_blob": "5e929833db9aad721fb664a960ffda7f0d2eea11"
+    },
+    "progress_objective.py": {
+      "sha256": "ba11e4bd36e823db13be5a70a70d807f9f480a5428b11cf8e4deb815b41f997e",
+      "git_blob": "ea6de3eea46694787725cac7e2707b04efdd9eed"
+    },
+    "experiments/adaptive_research/experiment.py": {
+      "sha256": "8a72aa7d04deadb041fc7edcaf6700ec39be7d5c959328293e7cef2e9b6b1a52",
+      "git_blob": "8bb376ea3256f14a1de535aaef8b1812c07cd3f7"
+    },
+    "experiments/adaptive_research/pinned.py": {
+      "sha256": "9f9d2c7efdf61208f280b2e66b262d83d9304d8c0271ab8989a223986f776efc",
+      "git_blob": "dc4515de5d4ad0930dbc2037b5db728ba7d60c2a"
+    },
+    "experiments/adaptive_research/production.py": {
+      "sha256": "ba55e1abbc1d8f6caa1b53c0b837a6199d524e5df721313058dd633255b88db1",
+      "git_blob": "3821e904795102a339eadbea0ac0e681a1a46aca"
+    }
+  },
+  "raw_results_sha256": {
+    "production-comparison.json": "fd5b60c1ea984baaefb9725b3545437c6cdae90af0443202ed6e7b945a63013c",
+    "production-adversarial.json": "a335959b2755204326b4f318f129945727ec4f9456eafb3a62c01f3e85913514",
+    "production-fine.json": "e8064a2a4b24d5dc92bb3c82512474fbc815c8e0c38eb4141f34aee61998e778"
+  },
+  "reproducibility": "The packaged runner replayed 12 scenario/policy/seed rows exactly; the full original grid used the same production source and model with a logging-only adapter.",
+  "rounding": "CSV display values rounded to six decimal places; regenerate raw floating-point rows with production.py.",
+  "ci_run": "https://github.com/Jagalite/kyoto/actions/runs/38575702786",
+  "ci_scope": "292 tests with real Cargo enabled on Ubuntu Python 3.9/3.13 and macOS Python 3.13; resource fault injection remains synthetic in worker integration tests."
+}

@@ -12,6 +12,7 @@ from disk_io import sample_disks, disk_rates, pressured_disks
 from deferral import SWAP_RATE_MB
 from scheduling import bounded_output
 from hill_climbing import HillClimbingController
+from kyoto_adaptive import KyotoController
 
 SAMPLE_SECONDS = 2
 RAMP_SECONDS = SAMPLE_SECONDS
@@ -91,17 +92,29 @@ class AdaptiveController:
         self.limit = 1
         self.last_increase = None
         self.hill_climber = HillClimbingController()
+        self.kyoto_controller = KyotoController()
         self.mode = None
+
+    def observe_result(self, job, now):
+        """Consume a terminal result once, after the executor has persisted it."""
+        if self.mode == 'kyoto':
+            self.kyoto_controller.observe_result(job, now)
+
+    def observe_active_drain(self, job, now):
+        if self.mode == 'kyoto':
+            self.kyoto_controller.observe_active_drain(job, now)
 
     def update(self, config, host, queued, running, now):
         auto = config['max_running'] == 'auto'
         smart_auto = auto and config['mode'] == 'smart'
         hill_climb = config['mode'] == 'hill-climb'
+        kyoto_mode = config['mode'] == 'kyoto'
         if self.mode != config['mode']:
             self.hill_climber = HillClimbingController()
+            self.kyoto_controller = KyotoController()
             self.limit, self.last_increase = 1, None
             self.mode = config['mode']
-        ceiling = config['cpu_budget'] if smart_auto or (auto and hill_climb) else (1 if auto else config['max_running'])
+        ceiling = config['cpu_budget'] if smart_auto or (auto and (hill_climb or kyoto_mode)) else (1 if auto else config['max_running'])
         aware = config.get('pressure_aware', True)
         snapshot = dict(host)
         snapshot['disk_io'] = disk_rates(self.previous.get('disk_counters') if self.previous else None,
@@ -149,12 +162,12 @@ class AdaptiveController:
             ceiling = min(ceiling, 1)
             if not blocked:
                 reason = 'disk pressure: ' + ', '.join(snapshot['pressured_disks']) + '; limiting to one running job'
-        if hill_climb:
+        if hill_climb or kyoto_mode:
             snapshot.update(effective_max_running=0 if blocked else ceiling,
                             concurrency_ceiling=ceiling, admission_reason=reason,
                             effective_memory_reserve_mb=reserve, automatic=True,
                             pressure_aware=aware)
-            return self.hill_climber.update(config, snapshot, queued, running, now)
+            return (self.kyoto_controller if kyoto_mode else self.hill_climber).update(config, snapshot, queued, running, now)
         if blocked:
             self.limit = 0
             self.last_increase = now

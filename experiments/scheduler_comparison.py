@@ -17,6 +17,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+from active_draining import ActiveDrainController
 from pressure import AdaptiveController
 from deferral import DeferralController, COOLDOWN_SECONDS, RELIEF_SECONDS
 from preemption import choose_preemption
@@ -73,15 +74,19 @@ POLICIES = ['fifo-auto', 'fifo-8', 'smart-auto', 'smart-no-defer',
 
 def config_for(name):
     config = dict(DEFAULT_CONFIG, cpu_budget=8, paused=False)
-    if name.startswith('hill-'):
+    if name in ('kyoto-auto', 'kyoto-no-defer'):
+        config.update(mode='kyoto')
+    elif name.startswith('hill-'):
         config.update(mode='hill-climb')
     elif name.startswith('fifo-'):
         config.update(mode='fifo', max_running='auto' if name.endswith('auto') else 8)
     elif name.startswith('smart-fixed-'):
-        config['max_running'] = int(name.rsplit('-', 1)[1])
+        config.update(mode='smart', max_running=int(name.rsplit('-', 1)[1]))
     elif name == 'smart-no-defer':
-        config['auto_defer'] = False
-    elif name != 'smart-auto':
+        config.update(mode='smart', auto_defer=False)
+    elif name == 'smart-auto':
+        config.update(mode='smart')
+    else:
         raise ValueError(name)
     return config
 
@@ -89,7 +94,7 @@ def config_for(name):
 def jobs_for(settings, seed, seconds):
     rng = random.Random(seed)
     jobs = []
-    count = 80 if not settings.get('arrivals') else (12 + int(seconds / 10))
+    count = settings.get('count', 80) if not settings.get('arrivals') else (12 + int(seconds / 10))
     for i in range(count):
         total = settings.get('work', 120) * rng.uniform(1-settings.get('spread', .35), 1+settings.get('spread', .35))
         submitted = 0.
@@ -112,6 +117,10 @@ def jobs_for(settings, seed, seconds):
 
 
 def curve_at(settings, now):
+    if 'curve_values' in settings:
+        if 'changed_values' in settings and now >= settings.get('change_at', 600):
+            return settings['changed_values']
+        return settings['curve_values']
     name = settings.get('curve', 'peak3')
     if settings.get('change') == 'down' and now >= 600:
         name = 'serial'
@@ -124,9 +133,9 @@ def curve_at(settings, now):
 
 def environment(settings, active, now):
     burst = 250 <= now % 600 < 400
-    external = 6 if settings.get('external_cpu') and burst else 0
-    available = max(0, 14000 - sum(j['current_rss_mb'] for j in active))
-    ram_bad = available < 1000
+    external = settings.get('external_cores', 6) if settings.get('external_cpu') and burst else 0
+    available = max(0, settings.get('available_mb', 14000) - sum(j['current_rss_mb'] for j in active))
+    ram_bad = available < settings.get('pressure_reserve_mb', 1000)
     disk_bad = len(active) > settings.get('disk_cliff', 100)
     swap_bad = settings.get('swap_bursts') and burst
     return dict(load=sum(settings.get('cpu_per_job', .5) for j in active) + external,
@@ -137,11 +146,16 @@ def environment(settings, active, now):
 
 
 class Telemetry:
-    def __init__(self):
+    def __init__(self, settings=None):
+        self.settings = settings or {}
+        self.load_ema = 0.
         self.busy = self.idle = self.swap = self.ops = self.io_ns = 0.
 
     def advance(self, env, dt):
-        busy = min(100, 100 * env['load'] / 8)
+        busy = min(100, 100 * env['load'] / self.settings.get('cpu_budget', 8))
+        tau = self.settings.get('load_tau', 0)
+        self.load_ema = ((self.load_ema * math.exp(-dt/tau) + env['load'] * (1-math.exp(-dt/tau)))
+                         if tau else env['load'])
         self.busy += busy * dt
         self.idle += (100-busy) * dt
         self.swap += env['swap'] * dt
@@ -151,16 +165,19 @@ class Telemetry:
     def sample(self, settings, env, now):
         return dict(valid=env['valid'], sample_monotonic=now, sampled_at=now,
             cpu_ticks=[self.busy, 0, self.idle, 0], cpu_idle_indices=[2],
-            load_average_1m=env['load'], available_mb=env['available'], total_mb=16000,
+            load_average_1m=self.load_ema if settings.get('load_tau') else env['load'],
+            available_mb=env['available'], total_mb=settings.get('total_mb', 16000),
             pressure='warning' if env['ram_bad'] else 'normal',
             swap_in_mb=0., swap_out_mb=self.swap,
-            disk_counters=dict(valid=not settings.get('missing_disk', False), monotonic=now,
+            disk_counters=dict(valid=not (settings.get('missing_disk', False) or
+                (settings.get('disk_gap') and settings['disk_gap'][0] <= now % settings.get('disk_period', 600) < settings['disk_gap'][1])), monotonic=now,
                 devices={'model': dict(identity=1, read_ops=self.ops, read_bytes=self.ops*4096,
                     read_ns=self.io_ns, write_ops=0, write_bytes=0, write_ns=0)}))
 
 
 def progress_for(job, settings, now):
-    if settings.get('progress') == 'missing' or now-job['started'] < settings.get('reporting_delay', 0):
+    if (settings.get('progress') == 'missing' or now < settings.get('missing_until', 0)
+            or now-job['started'] < settings.get('reporting_delay', 0)):
         return dict(measurable=False)
     phases = settings.get('phases', 1)
     total = job['total_work'] / phases
@@ -171,7 +188,8 @@ def progress_for(job, settings, now):
         value = math.floor(value / quantum) * quantum
     return dict(measurable=True, phase=str(phase), confidence='high', measurement=dict(
         source='explicit', epoch=f"{job['attempt']}:{phase}", value=value,
-        total=None if settings.get('progress') == 'unknown_total' else total))
+        total=None if (settings.get('progress') == 'unknown_total' or
+            (settings.get('progress') == 'final-only' and job['work'] < job['total_work']-1e-8)) else total))
 
 
 def percentile(values, fraction):
@@ -184,23 +202,38 @@ def simulate(settings, policy_name, seed, *, seconds=1200, step=.5, original_fac
     if step <= 0 or abs(2/step-round(2/step)) > 1e-9 or abs(seconds/step-round(seconds/step)) > 1e-9:
         raise ValueError('step must divide both two seconds and the horizon')
     config = config_for(policy_name)
+    config['cpu_budget'] = settings.get('cpu_budget', 8)
+    config['active_drain'] = settings.get('active_drain', False)
+    if policy_name == 'kyoto-no-defer':
+        config.update(mode='kyoto', auto_defer=False)
+    if settings.get('auto_defer') is False:
+        config['auto_defer'] = False
+    if 'numeric_cap' in settings and config['max_running'] == 'auto':
+        config['max_running'] = settings['numeric_cap']
     controller = AdaptiveController()
     if policy_name == 'hill-original':
         if original_factory is None:
             raise ValueError('original controller factory required')
         controller.mode = 'hill-climb'  # Preserve injection across first update.
         controller.hill_climber = original_factory()
-    deferrer, telemetry = DeferralController(), Telemetry()
+    publish_result = getattr(controller, 'observe_result', lambda job, now: None)
+    deferrer, telemetry = DeferralController(), Telemetry(settings)
+    active_drainer = ActiveDrainController()
     all_jobs = jobs_for(settings, seed, seconds)
     future = sorted(all_jobs, key=lambda j: (j['submitted'], j['id']))
     queued, active, events, samples = [], [], [], []
     policy = dict(config, max_running=1)
     snapshot = {}
     physical = wasted = pressure_seconds = mismatch_seconds = 0.
-    preemptions = deferrals = 0
+    preemptions = deferrals = active_drains = 0
     next_preemption = 0.
     noise_rng = random.Random(seed+10000)
     noise = 1.
+    noise_state = 0.
+    max_actual = 0
+    time_optimal = 0.
+    failures = 0
+    terminal_failures = set()
     for tick in range(round(seconds/step)+1):
         now = round(tick*step, 8)
         if tick:
@@ -212,31 +245,55 @@ def simulate(settings, policy_name, seed, *, seconds=1200, step=.5, original_fac
                 pressure_seconds += step
             if len(active) > policy['max_running']:
                 mismatch_seconds += step
+            maximum = max(curve_at(settings, prior))
+            if active and curve_at(settings, prior)[len(active)] >= .95 * maximum:
+                time_optimal += step
             if active:
                 increment = curve_at(settings, prior)[len(active)] * noise * env['factor'] * step / len(active)
                 for job in active:
-                    achieved = min(increment, job['total_work']-job['work'])
+                    earned = 0. if settings.get('hang_first') and job['id'] == 'job-0000' else increment
+                    achieved = min(earned, job['total_work']-job['work'])
                     job['work'] += achieved
                     physical += achieved
         while future and future[0]['submitted'] <= now:
             queued.append(future.pop(0))
         sampled = tick % round(2/step) == 0
         if sampled:
-            noise = noise_rng.uniform(1-settings.get('noise', 0), 1+settings.get('noise', 0))
+            if settings.get('noise_rho') is not None:
+                rho=settings['noise_rho']; cv=settings.get('noise',0)
+                if not 0<=rho<1 or cv<0:raise ValueError('invalid correlated noise')
+                noise_state=rho*noise_state+math.sqrt(1-rho*rho)*noise_rng.gauss(0,1)
+                sigma=math.sqrt(math.log1p(cv*cv))
+                noise=math.exp(sigma*noise_state-.5*sigma*sigma)
+            else:
+                noise = noise_rng.uniform(1-settings.get('noise', 0), 1+settings.get('noise', 0))
             for job in active:
                 job['progress'] = progress_for(job, settings, now)
             env = environment(settings, active, now)
             policy, snapshot = controller.update(config, telemetry.sample(settings, env, now), queued, active, now)
+            snapshot['job_progress'] = {j['id']: j.get('progress', {}) for j in active}
+        # Terminal build failures are not retried automatically. Failures never count as successes.
+        if settings.get('failure_modulo'):
+            for job in list(active):
+                if int(job['id'].split('-')[-1]) % settings['failure_modulo'] == 0 and job['work'] >= .6 * job['total_work']:
+                    wasted += job['work']
+                    job.update(work=0., status='failed', deferring=False)
+                    publish_result(dict(job, exit_code=1), now)
+                    active.remove(job)
+                    terminal_failures.add(job['id'])
+                    failures += 1
         # Reap after host sampling, like the production worker.
         for job in list(active):
             if job['work'] >= job['total_work']-1e-8:
-                job.update(finished=now, status='succeeded', deferring=False)
+                job.update(finished=now, status='succeeded', exit_code=0, deferring=False)
+                publish_result(job, now)
                 active.remove(job)
             elif job.get('stop_at', float('inf')) <= now:
                 lost = job['work'] * (1-settings.get('retention', 0))
                 wasted += lost
                 job.update(work=job['work']-lost, status='queued', deferring=False,
                            not_before=now+COOLDOWN_SECONDS, started=None)
+                publish_result(job, now)
                 job.pop('stop_at')
                 active.remove(job)
                 queued.append(job)
@@ -250,14 +307,23 @@ def simulate(settings, policy_name, seed, *, seconds=1200, step=.5, original_fac
                 if choice:
                     victim, beneficiary = choice
                     cause = 'short-job'
+            if victim is None:
+                proposed = active_drainer.choose(config, snapshot, active, now, now, eligible)
+                if proposed is not None:
+                    victim = next(j for j in active if j['id'] == proposed['id'])
+                    cause = 'active-drain'
             if victim is not None:
-                victim.update(deferring=True, stop_at=now+1,
+                if cause == 'active-drain':
+                    getattr(controller, 'observe_active_drain', lambda job, now: None)(proposed, now)
+                victim.update(deferring=True, deferral_count=victim.get('deferral_count', 0)+1, stop_at=now+settings.get('termination_delay', 1),
                               preempt_for=beneficiary['id'] if beneficiary else None)
                 next_preemption = now+RELIEF_SECONDS
                 preemptions += cause == 'short-job'
                 deferrals += cause == 'pressure'
+                active_drains += cause == 'active-drain'
                 events.append(dict(at=now, cause=cause, victim=victim['id'],
-                                   beneficiary=beneficiary['id'] if beneficiary else None, work=victim['work']))
+                                   beneficiary=beneficiary['id'] if beneficiary else None, work=victim['work'],
+                                   followup=bool(proposed.get('active_drain_followup')) if cause == 'active-drain' else False))
         if not any(j['deferring'] for j in active):
             while len(active) < policy['max_running']:
                 job, _ = choose_job(queued, active, policy, now)
@@ -270,12 +336,17 @@ def simulate(settings, policy_name, seed, *, seconds=1200, step=.5, original_fac
                 if job['first_started'] is None:
                     job['first_started'] = now
                 active.append(job)
-        assert len(active) <= 8
+        hard_cap = settings.get('numeric_cap', config['cpu_budget']) if config['max_running'] == 'auto' else config['max_running']
+        assert len(active) <= hard_cap
+        max_actual = max(max_actual, len(active))
         if sampled and trace:
             samples.append(dict(at=now, actual=len(active), target=policy['max_running'],
                 completed=sum(j['finished'] is not None for j in all_jobs),
                 useful_work=sum(j['work'] for j in all_jobs), pressure=snapshot.get('admission_reason'),
-                hill_phase=snapshot.get('hill_climb', {}).get('phase')))
+                hill_phase=snapshot.get('hill_climb', {}).get('phase'),
+                kyoto_state=snapshot.get('kyoto', {}).get('state'),
+                decisions=snapshot.get('hill_climb', {}).get('decisions', []),
+                drain_revalidation=snapshot.get('hill_climb', {}).get('drain_revalidation')))
     arrived = [j for j in all_jobs if j['submitted'] < seconds]
     completed = [j for j in arrived if j['finished'] is not None]
     unfinished = [j for j in arrived if j['finished'] is None]
@@ -291,12 +362,15 @@ def simulate(settings, policy_name, seed, *, seconds=1200, step=.5, original_fac
         completed_mean_flow=statistics.mean(j['finished']-j['submitted'] for j in completed) if completed else None,
         makespan=max(j['finished'] for j in completed) if not unfinished else None,
         pressure_seconds=pressure_seconds, excess_running_seconds=mismatch_seconds,
-        preemptions=preemptions, pressure_deferrals=deferrals, actual_final=len(active), target_final=policy['max_running'])
+        preemptions=preemptions, pressure_deferrals=deferrals, active_drains=active_drains, actual_final=len(active), target_final=policy['max_running'])
     for label, cohort in (('short', [j for j in arrived if j['total_work'] < 600]),
                           ('long', [j for j in arrived if j['total_work'] >= 600])):
         summary[label+'_restricted_mean_flow'] = (statistics.mean(
             (j['finished'] if j['finished'] is not None else seconds)-j['submitted'] for j in cohort) if cohort else None)
         summary[label+'_completion_fraction'] = (sum(j['finished'] is not None for j in cohort)/len(cohort) if cohort else None)
+    summary.update(max_actual=max_actual, fraction_time_near_curve_optimum=time_optimal/seconds,
+                   supplied_curve_optimum=min(range(1,len(curve_at(settings,0))), key=lambda n: -curve_at(settings,0)[n]),
+                   successful_work=sum(j['total_work'] for j in completed), failures=failures)
     summary['never_started'] = sum(j['first_started'] is None for j in arrived)
     return dict(summary={k: round(v, 6) if isinstance(v, float) else v for k,v in summary.items()}, events=events, trace=samples,
                 jobs=[{k: job[k] for k in ('id','submitted','total_work','work','first_started','finished','attempt')}

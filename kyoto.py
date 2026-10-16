@@ -21,6 +21,7 @@ from commands import PRIORS
 from command_policy import initialize as initialize_policy, preset as policy_preset, read_policy, validate_policy, prepare_submission, parameter as policy_parameter
 from progress import job_progress, ProgressTracker
 from deferral import DeferralController, COOLDOWN_SECONDS, RELIEF_SECONDS
+from active_draining import ActiveDrainController, ACTION_INTERVAL_SECONDS
 from preemption import choose_preemption
 from pressure import AdaptiveController, SAMPLE_SECONDS, sample_host
 
@@ -70,6 +71,10 @@ def connect(root, *, preview=False):
     db.row_factory = sqlite3.Row
     # Serialize migrations across simultaneous submitters/workers.
     db.execute('BEGIN IMMEDIATE')
+    # Previous implicit-Smart queues keep Smart; only genuinely new queues use Kyoto.
+    previous_queue = db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='jobs'"
+    ).fetchone() is not None
     db.execute('''CREATE TABLE IF NOT EXISTS jobs (
         id TEXT PRIMARY KEY, command TEXT, cwd TEXT, environment TEXT, signature TEXT,
         status TEXT, submitted REAL, started REAL, finished REAL, exit_code INTEGER,
@@ -79,6 +84,9 @@ def connect(root, *, preview=False):
         if name not in existing:
             db.execute(f'ALTER TABLE jobs ADD COLUMN {name} {declaration}')
     db.execute('CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
+    # Persist default at creation time so upgrades cannot silently switch modes.
+    db.execute("INSERT OR IGNORE INTO settings(key, value) VALUES ('mode', ?)",
+               (json.dumps('smart' if previous_queue else 'kyoto'),))
     db.execute('CREATE TABLE IF NOT EXISTS runtime (id INTEGER PRIMARY KEY, value TEXT NOT NULL)')
     db.execute('CREATE TABLE IF NOT EXISTS worker_restart (request_id TEXT PRIMARY KEY, session TEXT NOT NULL, expires REAL NOT NULL)')
     if 'request_id' not in {r[1] for r in db.execute('PRAGMA table_info(worker_restart)')}:
@@ -165,13 +173,27 @@ def group_alive(pgid):
         return True
 
 
-def begin_deferral(db, job_id, now, reason='sustained memory/swap pressure', preempt_for=None):
+def begin_deferral(db, job_id, now, reason='sustained memory/swap pressure', preempt_for=None,
+                   drain_request=None):
     db.execute('BEGIN IMMEDIATE')
     try:
         row = db.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone()
         if row is None or row['cancel'] or row['status'] != 'running' or row['deferring']:
             db.rollback()
             return False
+        if reason.startswith('active drain:'):
+            current = config_for(db)
+            if (current.get('mode') != 'kyoto' or current.get('active_drain') is not True
+                    or not current.get('auto_defer', True) or not current.get('pressure_aware', True)
+                    or current.get('paused')):
+                db.rollback()
+                return False
+            expected_count = 1 if drain_request and drain_request.get('active_drain_followup') is True else 0
+            if (row['deferral_count'] != expected_count or (drain_request is not None
+                    and (row['attempt_token'] != drain_request.get('attempt_token')
+                         or row['started'] != drain_request.get('started')))):
+                db.rollback()
+                return False
         if preempt_for is not None:
             target = db.execute("SELECT 1 FROM jobs WHERE id=? AND status='queued' AND cancel=0 AND not_before<=?", (preempt_for, now)).fetchone()
             if not target or config_for(db).get('paused'):
@@ -269,6 +291,10 @@ def worker(root):
         controller = AdaptiveController()
         progress_tracker = ProgressTracker()
         deferrer = DeferralController()
+        active_drainer = ActiveDrainController()
+        last_active_drain = db.execute("SELECT MAX(requested) FROM deferred_attempts WHERE reason LIKE 'active drain:%'").fetchone()[0]
+        if last_active_drain is not None:
+            active_drainer.next_action = time.monotonic() + max(0, last_active_drain + ACTION_INTERVAL_SECONDS - time.time())
         next_preemption = 0
         last_deferral = db.execute('SELECT MAX(requested) FROM deferred_attempts').fetchone()[0]
         if last_deferral is not None:
@@ -312,13 +338,13 @@ def worker(root):
             if now - last_host_sample >= SAMPLE_SECONDS or config != last_config:
                 queued = [job_dict(r) for r in db.execute("SELECT * FROM jobs WHERE status='queued' AND cancel=0")]
                 running = [job_dict(r) for r in db.execute("SELECT * FROM jobs WHERE status='running'")]
-                progress_tracker.prune([j['id'] for j in running] if config['mode'] == 'hill-climb' else [])
-                if config['mode'] == 'hill-climb':
+                progress_tracker.prune([j['id'] for j in running] if config['mode'] in ('hill-climb', 'kyoto') else [])
+                if config['mode'] in ('hill-climb', 'kyoto'):
                     for job in running:
                         job['progress'] = progress_tracker.sample(root, job, now)
                 host = sample_host()
                 policy, pressure_snapshot = controller.update(config, host, queued, running, time.monotonic())
-                if config['mode'] == 'hill-climb':
+                if config['mode'] in ('hill-climb', 'kyoto'):
                     pressure_snapshot['job_progress'] = {j['id']: j['progress'] for j in running}
                 pressure_snapshot['accounted_rss_mb'] = {j['id']: j['current_rss_mb'] for j in running}
                 pressure_snapshot['config'] = config
@@ -329,6 +355,8 @@ def worker(root):
                 pressure_snapshot['supports_recovery'] = True
                 pressure_snapshot['supports_restart'] = True
                 pressure_snapshot['supports_hill_climb'] = True
+                pressure_snapshot['supports_kyoto'] = True
+                pressure_snapshot['active_drain'] = dict(active_drainer.diagnostics)
                 pressure_snapshot['signal_errors'] = {job_id: state['signal_error'] for job_id, state in active.items()
                                                       if state.get('signal_error')}
                 pressure_snapshot['recovery_ready'] = recovery_ready
@@ -358,6 +386,10 @@ def worker(root):
                         db.execute('UPDATE jobs SET deferring=0 WHERE id=?', (job_id,))
                         db.execute("UPDATE deferred_attempts SET finished=?, reason=reason || '; command outcome unknown' WHERE job_id=? AND finished IS NULL", (time.time(), job_id))
                         db.commit()
+                    # Use only durable terminal outcomes, never disappearance
+                    # from a sampled cohort or a counter reaching 100 percent.
+                    completed = db.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone()
+                    controller.observe_result(dict(completed), time.monotonic())
                     del active[job_id]
                     continue
                 if state['cancelled'] or state.get('deferring'):
@@ -377,7 +409,15 @@ def worker(root):
                         candidate, waiting = decision
                         preempt_for = waiting['id']
                         reason = 'yielding to short job ' + preempt_for
-                if candidate and begin_deferral(db, candidate['id'], now, reason, preempt_for):
+                if candidate is None:
+                    candidate = active_drainer.choose(config, pressure_snapshot, running,
+                        time.monotonic(), time.time(), eligible)
+                    if candidate is not None:
+                        reason = candidate['active_drain_reason']
+                if candidate and begin_deferral(db, candidate['id'], now, reason, preempt_for,
+                        drain_request=candidate if reason.startswith('active drain:') else None):
+                    if reason.startswith('active drain:'):
+                        controller.observe_active_drain(candidate, time.monotonic())
                     next_preemption = time.monotonic() + RELIEF_SECONDS
                     state = active[candidate['id']]
                     state['deferring'] = True
@@ -459,16 +499,28 @@ def recover_existing(root, timeout=5):
         return True
     ensure_worker(root)
     deadline = time.monotonic() + timeout
-    db = sqlite3.connect(root / 'queue.sqlite', timeout=.2)
+    db = sqlite3.connect(root / 'queue.sqlite', timeout=0)
     try:
         while True:
-            row = db.execute('SELECT value FROM runtime WHERE id=1').fetchone()
-            runtime = json.loads(row[0]) if row else {}
-            if worker_ready(root, runtime):
-                return True
-            if time.monotonic() >= deadline:
+            # A recovery/migration lock is temporary, not proof that the
+            # worker failed. Keep the same readiness deadline; never report
+            # the last saved runtime as current while its read is blocked.
+            try:
+                row = db.execute('SELECT value FROM runtime WHERE id=1').fetchone()
+                runtime = json.loads(row[0]) if row else {}
+                if worker_ready(root, runtime):
+                    return True
+            except sqlite3.OperationalError as exc:
+                code = getattr(exc, 'sqlite_errorcode', None)
+                busy = ((code & 255) in (5, 6) if isinstance(code, int) else
+                        str(exc) in ('database is locked', 'database table is locked',
+                                     'database schema is locked'))
+                if not busy:
+                    raise
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 return False
-            time.sleep(.1)
+            time.sleep(min(.1, remaining))
     finally:
         db.close()
 
@@ -711,9 +763,11 @@ def main():
         rule.add_argument('--scope', choices=['cargo', 'args'], default='cargo', help='Cargo options or arguments after --')
         rule.add_argument('--max-value', type=positive_int, required=action == 'limit')
     configure = commands.add_parser('config', help='Show or update shared live scheduling policy')
-    configure.add_argument('--mode', choices=['fifo', 'smart', 'hill-climb'], help='hill-climb is experimental; learns concurrency from command progress')
-    configure.add_argument('--max-running', type=concurrency_limit, help='Positive integer or auto; upper bound in hill-climb mode')
+    configure.add_argument('--mode', choices=['fifo', 'smart', 'hill-climb', 'kyoto'], help='kyoto combines Smart queue routing with measured adaptive concurrency')
+    configure.add_argument('--max-running', type=concurrency_limit, help='Positive integer or auto; concurrency ceiling in hill-climb and kyoto modes')
     configure.add_argument('--pressure-aware', choices=['on', 'off'], help='Gate new starts on memory, swap, and disk pressure')
+    configure.add_argument('--active-drain', choices=['on', 'off'],
+        help='Cost-gated rollback of a rejected Kyoto probe; requires auto-defer and pressure-aware (default off)')
     configure.add_argument('--auto-defer', choices=['on', 'off'], help='Stop and requeue eligible builds for sustained pressure or short-job priority (default on)')
     configure.add_argument('--cpu-budget', type=positive_int)
     configure.add_argument('--memory-budget-mb', type=nonnegative_float, help='Deprecated compatibility option; no admission effect')
@@ -819,7 +873,7 @@ def main():
         print(json.dumps(result))
     elif args.action == 'config':
         updates = {key: getattr(args, key) for key in DEFAULT_CONFIG if getattr(args, key) is not None}
-        for key in ('pressure_aware', 'auto_defer'):
+        for key in ('pressure_aware', 'auto_defer', 'active_drain'):
             if key in updates:
                 updates[key] = updates[key] == 'on'
         if args.pause or args.resume:

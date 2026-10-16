@@ -167,8 +167,8 @@ class HillIntegrationTest(unittest.TestCase):
         self.assertEqual(result['status'], 'succeeded', result)
         return result
 
-    def test_default_mode_and_live_mode_switch_reset_experiment(self):
-        defaults = self.cli('config')
+    def test_explicit_smart_mode_and_live_mode_switch_reset_experiment(self):
+        defaults = self.configure('--mode', 'smart')
         self.assertEqual(defaults['mode'], 'smart')
         self.assertEqual(defaults['max_running'], 'auto')
         self.assertTrue(defaults['pressure_aware'])

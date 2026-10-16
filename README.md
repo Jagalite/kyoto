@@ -54,7 +54,7 @@ explicitly change the shared admin policy:
 kyoto.py submit -- cargo test                           # Compile only under default policy
 cargo test                                            # Run directly after compilation
 kyoto.py config --mode fifo --max-running 2             # FIFO, two concurrent jobs
-kyoto.py config --mode smart --max-running auto         # Restore defaults
+kyoto.py config --mode smart --max-running auto         # Explicit Smart fallback
 ```
 
 Memory pressure can delay new starts. Estimates are approximate. Commands that
@@ -89,9 +89,32 @@ The test restriction recognizes Cargo commands and common wrappers; it does not
 inspect arbitrary shell scripts or custom aliases. Do not submit test execution
 through those wrappers.
 
-## Experimental hill climbing
+## Kyoto mode: unified adaptive scheduling
 
-**Experimental; general convergence and hardware performance are not qualified.**
+`kyoto` is the default for new queue databases. It keeps Smart job ordering and safe preemption active
+while using measured hill climbing to adjust concurrency. It uses a bounded
+fallback for missing progress, and explicitly degraded progress-based learning
+when disk telemetry has never been available (for example on Linux). Pressure,
+configuration limits, locks, and cancellation remain independent safety gates.
+Existing queues retain their saved mode, including legacy queues where Smart
+was previously implicit. Only newly initialized queues default to Kyoto.
+Active draining remains separately opt-in (`--active-drain on`).
+
+```sh
+python3 kyoto.py config --mode kyoto --max-running auto
+python3 kyoto.py health
+```
+
+See [Kyoto mode architecture and limitations](docs/KYOTO_MODE.md) and the
+[reproducible Smart/Hill/Kyoto comparison](experiments/kyoto_mode_comparison.py).
+
+## Progress-driven hill climbing
+
+The `hill-climb` mode uses the production controller, including bounded
+telemetry recovery. It is not the research adapter. Kyoto is now the default for new queues.
+See [the controller contract and qualification results](docs/HILL_CLIMBING.md).
+
+**General convergence and workload-specific hardware performance are not guaranteed.**
 Closed-loop model tests now settle near the known optimum for finite workloads,
 including noisy observations and mixed job sizes. Sparse counters and changing
 workloads remain imperfect, and a rejected extra slot stays occupied until a
@@ -99,8 +122,7 @@ running command finishes. See the [reproducible convergence audit](experiments/R
 for comparisons with the original implementation and the remaining limits.
 
 `hill-climb` learns a concurrency limit from **progress per command** and measured
-CPU use, available RAM, swap activity, and disk latency/contention. Smart mode
-remains the default. Try the experiment in its own queue first, using the same
+CPU use, available RAM, swap activity, and disk latency/contention. New queues default to Kyoto; existing queues keep their mode. Evaluate this mode in its own queue first, using the same
 `--state` path for every command:
 
 ```sh
@@ -131,7 +153,14 @@ specific to smart mode. Explicit resource locks and aging continue to apply.
 
 `--max-running N` is an upper bound in this mode; `auto` uses `--cpu-budget` as
 its upper bound. Missing totals, progress, or resource measurements normally
-keep admission at one slot. A newly admitted command has bounded startup time
+keep admission at one slot. A brief disk-sensor interruption after a measured
+limit has been learned instead closes admission for at most ten seconds while
+retaining that limit. It discards the interrupted rate window and probe; recovery
+starts fresh measurements. Retry/phase/counter changes, a reduced cap, memory or
+swap pressure, and worker restarts cannot inherit this grace. Repeated sensor
+flicker cannot renew it without a productive measured window. A persistent outage
+returns to the one-slot fallback. Running commands are never stopped by this
+telemetry mechanism. A newly admitted command has bounded startup time
 to report its first counter during an upward trial or an ordinary refill of a
 learned limit (120 seconds by default). Refill grace requires a measured surviving
 incumbent. Known commands losing progress do not get this grace period.
@@ -140,7 +169,8 @@ require new measurements. Ordinary completions preserve the learned limit.
 No optimizer state is carried
 across worker restarts. The dashboard shows the current decision; `health`
 includes `runtime.hill_climb` diagnostics (target, actual running count, drain
-duration, measured rates, hold cause, and trial decisions) and `runtime.job_progress` for each
+duration, measured rates, hold cause, trial decisions, qualified limit, telemetry
+state, and whether admission is paused for telemetry) and `runtime.job_progress` for each
 running command. `show` and `status` expose progress and its source as well.
 
 Cargo progress bars, libtest results, Cargo JSON artifact messages, and ordinary

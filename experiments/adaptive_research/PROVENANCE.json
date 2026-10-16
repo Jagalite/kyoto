@@ -1,0 +1,48 @@
+{
+  "study_date": "2026-10-13 America/New_York",
+  "baseline_commit": "337f5fd7dc79e019ce0912c827363228c5c10be8",
+  "packaging_base_commit": "940f8259ae2455383dd123da50b4d9fa7c739c9f",
+  "upstream_git_blob_hashes": {
+    "hill_climbing.py": "0cc21cfd5c7bb0fe1523a25672da012958806dbb",
+    "progress_objective.py": "ea6de3eea46694787725cac7e2707b04efdd9eed"
+  },
+  "original_archive": {
+    "name": "kyoto_adaptive_research_2026-10-13.zip",
+    "sha256": "3d9e134c4a49e21082941e2ccd6dd840c0dcc233d02cf5ff603d09d76cad4ceb",
+    "supplied_with": "original conversation research handoff; not stored in this PR"
+  },
+  "original_study_counts": {
+    "main_core_simulations": 6944,
+    "extra_telemetry_simulations": 288,
+    "fine_step_simulations": 240,
+    "total_core_simulations": 7472,
+    "noise_probe_decisions": 645120,
+    "characterization_tests_passed": 32,
+    "valid_native_child_fixtures": 33
+  },
+  "pr_validation": {
+    "original_manifest_files_verified": 45,
+    "characterization_tests_passed": 32,
+    "packaging_tests_passed": 12,
+    "main_runs_replayed": 868,
+    "main_seeds": [
+      1,
+      101
+    ],
+    "telemetry_runs_replayed": 288,
+    "noise_decisions_replayed": 645120,
+    "native_fixtures_passed": 33,
+    "archived_numerical_mismatches": 0
+  },
+  "scope": "Vendored controller and objective only. No production scheduler changes; no whole-worker or Cargo hardware qualification.",
+  "packaging_changes": [
+    "Hash verification before module execution, including python -O; isolated imports.",
+    "Validated CLI/grid selections; configurable worker count; separate generated output.",
+    "One nonduplicated runner for main, telemetry, and sensitivity designs.",
+    "Explicit summary inputs; duplicate and unpaired observations rejected.",
+    "Bounded native readiness handshake, guaranteed child cleanup, core dumps disabled, explicit Linux opt-in."
+  ],
+  "raw_results": "Per-run JSON/CSV are regenerated with run_study.py; this PR stores selected original aggregates rather than duplicated multi-megabyte archives.",
+  "original_python": "3.13.5 (main, Jul 15 2026, 20:25:40) [GCC 14.2.0]",
+  "original_platform": "Linux-6.18.44-x86_64-with-glibc2.41"
+}

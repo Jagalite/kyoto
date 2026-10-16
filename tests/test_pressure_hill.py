@@ -46,4 +46,4 @@ class HillPressureTest(unittest.TestCase):
         self.assertNotIn('hill_climb', sample)
         self.config['mode'] = 'hill-climb'
         self.assertEqual(self.sample(4)[0]['max_running'], 1)
-        self.assertEqual(DEFAULT_CONFIG['mode'], 'smart')
+        self.assertEqual(DEFAULT_CONFIG['mode'], 'kyoto')

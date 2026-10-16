@@ -8,9 +8,9 @@ import subprocess
 import sys
 
 DEFAULT_CONFIG = {
-    'mode': 'smart', 'max_running': 'auto', 'cpu_budget': os.cpu_count() or 1,
+    'mode': 'kyoto', 'max_running': 'auto', 'cpu_budget': os.cpu_count() or 1,
     'memory_budget_mb': 0, 'aging_seconds': 300,
-    'min_available_memory_mb': 0, 'pressure_aware': True, 'auto_defer': True,
+    'min_available_memory_mb': 0, 'pressure_aware': True, 'auto_defer': True, 'active_drain': False,
 }
 
 
@@ -44,10 +44,10 @@ def choose_job(queued, running, config, now, available_mb=None):
     ordered = sorted(queued, key=lambda j: (j['submitted'], j['id']))
     from preemption import short_job
     aged = now - ordered[0]['submitted'] >= config['aging_seconds']
-    if config['mode'] == 'smart' and any(j['id'] in preferred for j in queued):
+    if config['mode'] in ('smart', 'kyoto') and any(j['id'] in preferred for j in queued):
         candidates = sorted((j for j in queued if j['id'] in preferred), key=lambda j: (j['estimate'], j['submitted'], j['id']))
         reason = 'short job granted preemption'
-    elif config['mode'] == 'smart' and any(short_job(j) for j in queued):
+    elif config['mode'] in ('smart', 'kyoto') and any(short_job(j) for j in queued):
         candidates = sorted((j for j in queued if short_job(j)), key=lambda j: (j['estimate'], j['submitted'], j['id']))
         reason = 'shortest estimated job (under ten minutes)'
     elif config['mode'] == 'fifo' or aged:
