@@ -348,7 +348,7 @@ class HillClimbingController:
             self._reset(now, snapshot.get('admission_reason', 'host pressure blocks admission'), phase='blocked')
         elif config.get('paused'):
             self._reset(now, 'scheduler paused; learning suspended', phase='paused')
-        elif config.get('pressure_aware', True) and snapshot.get('disk_pressure'):
+        elif config.get('pressure_aware', True) and snapshot.get('disk_pressure') and not snapshot.get('disk_pressure_scoped'):
             cap = 1
             self._reset(now, 'disk pressure; draining to one slot', phase='pressure')
         elif not running:

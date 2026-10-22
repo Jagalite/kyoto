@@ -8,7 +8,7 @@ import sys
 import time
 
 from cpu import sample_ticks, utilization
-from disk_io import sample_disks, disk_rates, pressured_disks
+from disk_io import sample_disks, disk_rates, pressured_disks, scheduling_devices
 from deferral import SWAP_RATE_MB
 from scheduling import bounded_output
 from hill_climbing import HillClimbingController
@@ -157,17 +157,24 @@ class AdaptiveController:
                                min(ceiling, max(1, len(running) + config['cpu_budget'] - math.ceil(load))))
             if not blocked:
                 reason = 'automatic observed load and pressure'
-        disk_limited = aware and snapshot['disk_pressure']
-        if disk_limited:
-            ceiling = min(ceiling, 1)
+        mapping_deadline = time.monotonic() + 1
+        snapshot['job_disks'] = ({job['id']: scheduling_devices(job, host.get('disk_counters'), deadline=mapping_deadline)
+                                  for job in running + queued}
+                                 if aware and snapshot['disk_pressure'] else {})
+        snapshot['disk_pressure_scoped'] = any(v is not None for v in snapshot['job_disks'].values())
+        if aware and snapshot['disk_pressure']:
+            if not snapshot['disk_pressure_scoped']:
+                ceiling = min(ceiling, 1)
             if not blocked:
-                reason = 'disk pressure: ' + ', '.join(snapshot['pressured_disks']) + '; limiting to one running job'
+                reason = 'disk pressure: ' + ', '.join(snapshot['pressured_disks']) + '; one job per affected physical drive'
+        disk_policy = dict(pressured_disks=snapshot['pressured_disks'], job_disks=snapshot['job_disks'])
         if hill_climb or kyoto_mode:
             snapshot.update(effective_max_running=0 if blocked else ceiling,
                             concurrency_ceiling=ceiling, admission_reason=reason,
                             effective_memory_reserve_mb=reserve, automatic=True,
                             pressure_aware=aware)
-            return (self.kyoto_controller if kyoto_mode else self.hill_climber).update(config, snapshot, queued, running, now)
+            policy, snapshot = (self.kyoto_controller if kyoto_mode else self.hill_climber).update(config, snapshot, queued, running, now)
+            return dict(policy, **disk_policy), snapshot
         if blocked:
             self.limit = 0
             self.last_increase = now
@@ -192,4 +199,4 @@ class AdaptiveController:
         snapshot.update(effective_max_running=self.limit, concurrency_ceiling=ceiling,
                         admission_reason=reason, effective_memory_reserve_mb=reserve,
                         automatic=smart_auto, pressure_aware=aware)
-        return policy, snapshot
+        return dict(policy, **disk_policy), snapshot

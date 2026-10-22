@@ -1,4 +1,4 @@
-"""Read-only macOS disk telemetry. Observational only; never gates admission."""
+"""Read-only macOS physical disk telemetry and job path mapping."""
 import json
 from pathlib import Path
 import plistlib
@@ -118,14 +118,21 @@ def disk_lines(sample):
     return lines
 
 
-def path_device(path):
+def probe_timeout(deadline):
+    remaining = 2 if deadline is None else min(2, deadline - time.monotonic())
+    if remaining <= 0:
+        raise TimeoutError('physical drive mapping budget exhausted')
+    return remaining
+
+
+def path_device(path, sample=None, deadline=None):
     """Map an existing ancestor to physical disks; APFS containers may span disks."""
     path = Path(path).resolve()
     while not path.exists() and path.parent != path:
         path = path.parent
-    output = bounded_output(['/bin/df', '-P', str(path)], timeout=2)
+    output = bounded_output(['/bin/df', '-P', str(path)], timeout=probe_timeout(deadline))
     device = output.splitlines()[-1].split()[0]
-    sample = sample_disks()
+    sample = sample_disks() if sample is None else sample
     physical = sample.get('volumes', {}).get(Path(device).name, [])
     # Resolve registry ancestry, including APFS synthesized volumes; never infer
     # physical disks by stripping a partition suffix from a synthesized device.
@@ -193,3 +200,49 @@ def diagnose(root, interval, samples):
             report[key + '_per_second'] = delta / elapsed if elapsed > 0 and delta >= 0 and key in current and key in previous else None
         print(json.dumps(report), flush=True)
         previous = current
+
+
+def scheduling_devices(job, sample=None, deadline=None):
+    """Resolve known job paths; unsupported commands or partial mappings stay unknown.
+
+    These are potential I/O locations, not per-process attribution. Arbitrary
+    build scripts can still access paths outside the declared/discovered set.
+    """
+    try:
+        probe_timeout(deadline)
+        import os
+        command = json.loads(job['command'])
+        env = json.loads(job['environment'])
+        if command and Path(command[0]).name == 'env':
+            command = command[1:]
+            while command and re.match(r'^[A-Za-z_][A-Za-z_0-9]*=', command[0]):
+                key, value = command.pop(0).split('=', 1)
+                env[key] = value
+        resources = job.get('resources', [])
+        if isinstance(resources, str):
+            resources = json.loads(resources)
+        cargo = command and Path(command[0]).name == 'cargo'
+        if not cargo and (not resources or '*' in resources):
+            return None
+        paths = [job['cwd'], *resources]
+        if cargo:
+            discovered, _ = discover_resources(command, job['cwd'], env, [],
+                probe=lambda command, **kw: bounded_output(command, timeout=probe_timeout(deadline), **kw))
+            if '*' in discovered:
+                return None
+            paths.extend(discovered)
+            home = env.get('HOME', os.path.expanduser('~'))
+            paths.extend([env.get('CARGO_HOME', str(Path(home) / '.cargo')),
+                          env.get('RUSTUP_HOME', str(Path(home) / '.rustup'))])
+        paths.append(env.get('TMPDIR') or env.get('TMP') or env.get('TEMP') or '/tmp')
+        devices = set()
+        for path in set(paths):
+            if path == '*':
+                return None
+            mapping = path_device(Path(job['cwd']) / path, sample, deadline=deadline)
+            if not mapping.get('devices'):
+                return None
+            devices.update(mapping['devices'])
+        return sorted(devices) or None
+    except (OSError, ValueError, KeyError, TypeError, IndexError, subprocess.TimeoutExpired):
+        return None

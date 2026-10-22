@@ -56,11 +56,17 @@ def choose_job(queued, running, config, now, available_mb=None):
     else:
         candidates = sorted(ordered, key=lambda j: (j['estimate'], j['submitted'], j['id']))
         reason = 'shortest estimated job that fits'
+    from disk_policy import disk_admissible
+    disk_wait = False
     for job in candidates:
+        if not disk_admissible(job, running, config):
+            disk_wait = True
+            continue
         if any(conflicts(job['resources'], other['resources']) for other in running):
             continue
         return job, reason
-    return None, 'waiting for explicitly requested resource locks' + ('; aged job ' + ordered[0]['id'][:8] + ' has priority' if aged else '')
+    wait_reason = 'waiting for physical drive pressure' if disk_wait else 'waiting for explicitly requested resource locks'
+    return None, wait_reason + ('; aged job ' + ordered[0]['id'][:8] + ' has priority' if aged else '')
 
 
 def forecast(queued, running, config, now):

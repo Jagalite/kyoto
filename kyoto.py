@@ -633,6 +633,8 @@ def status(db, root):
     fresh = runtime and now - runtime['sampled_at'] < 10 and dict(DEFAULT_CONFIG, **runtime.get('config', {})) == config
     policy = dict(config, max_running=runtime['effective_max_running'] if fresh else 0,
                   min_available_memory_mb=runtime['effective_memory_reserve_mb'] if fresh else 0)
+    if fresh:
+        policy.update(pressured_disks=runtime.get('pressured_disks', []), job_disks=runtime.get('job_disks', {}))
     available = runtime.get('available_mb') if fresh else None
     for job in running:
         job['host_accounted_rss_mb'] = runtime.get('accounted_rss_mb', {}).get(job['id'], 0) if fresh else 0

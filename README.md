@@ -366,11 +366,19 @@ worker retains its loaded code until its next normal restart. The `io` command
 works immediately with existing workers. With pressure control enabled, any
 physical disk with read or write operation times averaging at least 50 ms, at
 least 10 corresponding operations per second, and summed I/O time of at least
-one second per wall second caps admission at one running job. This is a
-conservative host-wide heuristic, not per-job I/O attribution. Sustained disk
+one second per wall second limits admission to one job using each affected physical drive. Jobs mapped to
+other drives can use the remaining scheduler slots. Source, Cargo workspace and
+output paths, Cargo/Rustup homes, temporary directories, and declared resource
+paths are mapped to physical devices; volumes sharing a device share its limit.
+Opaque commands without declared paths and incomplete mappings conservatively
+count against every pressured drive. Mapping probes share a one-second budget
+per host sample; jobs beyond that budget retain the unknown-mapping fallback.
+When no job has a resolved mapping, the
+existing one-job host limit remains. These are potential I/O locations, not
+per-job I/O attribution; arbitrary programs can access additional paths. Sustained disk
 pressure uses the existing six-in-ten-second deferral window and ten seconds
-between stops to reduce eligible builds one at a time, preserving at least one
-uncancelled job. Disk-only deferral favors long builds and protects those expected
+between stops to reduce eligible builds sharing an affected drive one at a time, preserving at
+least one uncancelled job on each affected drive. Disk-only deferral favors long builds and protects those expected
 to finish within two minutes. Memory/swap relief may still need to interrupt them.
 Healthy samples restore gradual admission; missing disk telemetry does not invent
 pressure. Use `python3 kyoto.py restart` to activate updated worker code.

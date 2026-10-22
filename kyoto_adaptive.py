@@ -65,7 +65,8 @@ class KyotoController:
                         and self.first_sample_at is not None and finite(now)
                         and now-self.first_sample_at >= FALLBACK_GRACE_SECONDS
                         and host_known(snapshot) and not snapshot.get('disk_pressure'))
-        pressure = config.get('pressure_aware', True) and snapshot.get('disk_pressure')
+        pressure = (config.get('pressure_aware', True) and snapshot.get('disk_pressure')
+                    and not snapshot.get('disk_pressure_scoped'))
         paused = bool(config.get('paused')) or snapshot.get('effective_max_running') == 0
         configured = config['cpu_budget'] if config['max_running'] == 'auto' else config['max_running']
         cap = max(1, min(configured, snapshot.get('concurrency_ceiling', configured)))

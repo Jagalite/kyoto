@@ -24,8 +24,32 @@ class DeferralController:
         self.previous = None
         self.previous_bad = False
         self.next_action = 0
+        self.drive_controllers = {}
 
     def choose(self, config, sample, running, now, wall_now, eligible_ids=None):
+        if 'pressured_disks' not in sample:
+            return self._choose(config, sample, running, now, wall_now, eligible_ids)
+        # Keep host memory/swap history independent of physical-drive history,
+        # including healthy intervals between bursts of memory pressure.
+        host_sample = dict(sample, disk_pressure=False)
+        chosen = self._choose(config, host_sample, running, now, wall_now, eligible_ids)
+        if under_pressure(host_sample):
+            self.drive_controllers.clear()
+            return chosen
+        active = set(sample['pressured_disks']) if sample.get('disk_pressure') else set()
+        for disk in sorted(active | self.drive_controllers.keys()):
+            controller = self.drive_controllers.setdefault(disk, DeferralController())
+            controller.next_action = max(controller.next_action, self.next_action)
+            candidate = controller._choose(config,
+                dict(sample, pressured_disks=[disk], disk_pressure=disk in active,
+                     _pressured_all=sample['pressured_disks']),
+                running, now, wall_now, eligible_ids if chosen is None else set())
+            if candidate is not None:
+                chosen = candidate
+                self.next_action = controller.next_action
+        return chosen
+
+    def _choose(self, config, sample, running, now, wall_now, eligible_ids=None):
         enabled = config.get('auto_defer', True) and config.get('pressure_aware', True)
         if not enabled or not sample.get('valid'):
             # Unobserved time must not count toward a later stop decision.
@@ -59,6 +83,14 @@ class DeferralController:
                      and (sample.get('swap_in_mb_per_second') or 0) < SWAP_RATE_MB
                      and (sample.get('swap_out_mb_per_second') or 0) < SWAP_RATE_MB)
         if disk_only:
+            if sample.get('pressured_disks'):
+                from disk_policy import affected_disks
+                # Preserve one runner on each affected device, regardless of
+                # how many jobs are running on unrelated drives.
+                all_drives = dict(sample, pressured_disks=sample.get('_pressured_all', sample['pressured_disks']))
+                candidates = [j for j in candidates if affected_disks(j, sample) and all(
+                    sum(disk in affected_disks(other, all_drives) for other in remaining) > 1
+                    for disk in affected_disks(j, all_drives))]
             from preemption import finishing_soon
             candidates = [j for j in candidates if not finishing_soon(j, wall_now)]
             if not candidates:
