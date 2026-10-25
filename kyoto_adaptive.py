@@ -55,6 +55,11 @@ class KyotoController:
             self.last_time = now
             if self.first_sample_at is None or clock_bad:
                 self.first_sample_at = now
+        # Unsupported Windows swap counters are distinct from a failed sensor.
+        # Keep the missing rates intact and enable only Kyoto's degraded path.
+        snapshot = dict(snapshot)
+        if snapshot.get('swap_telemetry_supported') is False:
+            snapshot['_kyoto_partial_swap'] = True
         disk_info = snapshot.get('disk_io')
         if not isinstance(disk_info, dict):
             disk_info = {}

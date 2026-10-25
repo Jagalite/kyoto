@@ -60,8 +60,8 @@ class PlanTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)/'absent'
             adjusted = self.invoke(root, '--', 'cargo', 'test')
-            self.assertEqual(adjusted['command'], ['cargo', 'test', '--no-run'])
-            self.assertIn('compiles only', adjusted['policy_message'])
+            self.assertEqual(adjusted['command'], ['cargo', 'test'])
+            self.assertIsNone(adjusted['policy_message'])
             self.assertFalse(root.exists())
             result = self.invoke(root, '--resource', directory, '--', 'cargo', 'test', '--no-run')
             self.assertEqual(result['command_kind'], 'test-compile')

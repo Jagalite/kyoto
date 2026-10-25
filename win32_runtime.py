@@ -129,7 +129,7 @@ def memory():
     value = psutil.virtual_memory()
     # Windows does not expose Unix swap-in/out counters through psutil.
     return dict(available_mb=value.available / 1048576, total_mb=value.total / 1048576,
-                swap_used_mb=None, pressure='normal' if value.percent < 90 else 'warning')
+                swap_used_mb=None, swap_telemetry_supported=False, pressure='normal' if value.percent < 90 else 'warning')
 
 
 def terminate_tree(pid):

@@ -33,6 +33,12 @@ class PolicyTest(unittest.TestCase):
         return evaluate(list(args), read_policy(self.db))['allowed']
 
     def test_defaults_and_admin_override(self):
+        for command in (['cargo', 'test'], ['cargo', 'bench'], ['cargo', 'test', '--doc']):
+            effective, info, message = prepare_submission(command, self.db)
+            self.assertEqual(effective, command)
+            self.assertTrue(info['executes_tests'])
+            self.assertIsNone(message)
+        preset(self.db, 'compile-only')
         self.assertFalse(self.allowed('cargo','test'))
         self.assertTrue(self.allowed('cargo','test','--no-run'))
         self.assertFalse(self.allowed('cargo','test','--','--no-run'))
@@ -44,6 +50,8 @@ class PolicyTest(unittest.TestCase):
         self.assertFalse(self.allowed('cargo','test'))
 
     def test_value_rules_cannot_change_boolean_flag_parsing(self):
+        preset(self.db, 'compile-only')
+        self.db.commit()
         self.rule('deny', '*', 'quiet', 'test')
         self.rule('deny', '*', 'no-run', 'ignored')
         self.assertFalse(self.allowed('cargo', '-q', 'test'))
@@ -94,6 +102,8 @@ class PolicyTest(unittest.TestCase):
         return json.loads(output.getvalue())
 
     def test_cli_plan_submit_and_remove(self):
+        preset(self.db, 'compile-only')
+        self.db.commit()
         self.assertEqual(self.cli('plan','--','cargo','test')['command'], ['cargo','test','--no-run'])
         rules=self.cli('policy','allow','test')
         rule_id=rules['rules'][-1]['id']
@@ -128,6 +138,8 @@ class PolicyTest(unittest.TestCase):
             worker.terminate();worker.wait(timeout=5)
 
     def test_wrappers_and_forwarded_arguments(self):
+        preset(self.db, 'compile-only')
+        self.db.commit()
         for command in [
             ['cargo', 'test', '--', '--nocapture'],
             ['cargo', '+stable', 't', '-p', 'example'],
@@ -164,6 +176,8 @@ class PolicyTest(unittest.TestCase):
             prepare_submission(['cargo', 'test'], self.db)
 
     def test_completion_retains_adjustment_and_log_path(self):
+        preset(self.db, 'compile-only')
+        self.db.commit()
         job = self.cli('submit', '--', 'cargo', 'test')
         kyoto.finish(self.db, job['id'], 'succeeded', 0)
         result = self.cli('wait', job['id'])
@@ -175,6 +189,8 @@ class PolicyTest(unittest.TestCase):
         self.assertEqual(result['log'], str(self.root.resolve() / (job['id'] + '.log')))
 
     def test_doc_tests_require_execution_but_doc_argument_values_do_not(self):
+        preset(self.db, 'compile-only')
+        self.db.commit()
         with self.assertRaisesRegex(ValueError, 'documentation tests'):
             prepare_submission(['cargo', 'test', '--doc'], self.db)
         with self.assertRaisesRegex(ValueError, 'documentation tests'):

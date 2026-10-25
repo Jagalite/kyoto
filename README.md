@@ -44,9 +44,12 @@ not apply. If a runner is killed, its surviving commands remain tracked, but
 without a durable result their final status is `interrupted`.
 
 CPU and physical-memory measurements are available. Swap rates, disk telemetry,
-Unix block counts, and wait-time peak RSS are reported as unavailable. The Kyoto
-and hill-climb modes retain their conservative fallback when required telemetry
-is missing; choose `config --mode fifo --max-running N` for fixed concurrency.
+Unix block counts, and wait-time peak RSS are reported as unavailable. Kyoto
+uses degraded learning from real command progress, CPU use, and physical memory when Windows swap and disk telemetry are unsupported. Commands without
+measurable progress use a bounded fallback of up to three jobs. Missing or invalid
+CPU/memory measurements still prevent ramp-up. The standalone hill-climb mode
+retains its conservative fallback; choose `config --mode fifo --max-running N`
+for fixed concurrency.
 The terminal dashboard prints periodically when curses is unavailable. Installing
 `windows-curses` optionally enables the interactive dashboard. Windows target
 sizes measure file lengths rather than Unix allocated disk blocks.
@@ -84,15 +87,14 @@ kyoto.py restart                            # Reload worker code, preserving bui
 
 ## Tests and scheduling
 
-Submit `cargo test` or `cargo bench` normally, without a compilation-only flag.
-Kyoto chooses compilation only or compilation plus execution from the shared
-policy. The default is compilation only, which the returned `policy_message`
-explains. After compilation, run tests and benchmarks outside Kyoto, or
-explicitly change the shared admin policy:
+Submit `cargo test` or `cargo bench` normally. By default, Kyoto compiles and
+runs tests and benchmarks. To opt into compilation only, select the shared
+`compile-only` policy preset or submit with `--no-run` explicitly.
 
 ```sh
-kyoto.py submit -- cargo test                           # Compile only under default policy
-cargo test                                            # Run directly after compilation
+kyoto.py submit -- cargo test                           # Compile and run tests
+kyoto.py policy preset compile-only                    # Opt into compilation only
+kyoto.py policy preset allow-all                       # Restore the default policy
 kyoto.py config --mode fifo --max-running 2             # FIFO, two concurrent jobs
 kyoto.py config --mode smart --max-running auto         # Explicit Smart fallback
 ```
@@ -254,14 +256,14 @@ python3 kyoto.py --state ~/.local/state/kyoto-hill-climb config --mode smart --m
 
 ```sh
 kyoto.py policy show
-kyoto.py policy allow test                         # Admin enables test execution
+kyoto.py policy allow test                         # Allow test execution under a restricted policy
 kyoto.py policy deny clean
 kyoto.py policy deny build --param profile --value release
 kyoto.py policy require build --param locked
 kyoto.py policy limit '*' --param jobs --max-value 4
 kyoto.py policy deny test --scope args --param nocapture
 kyoto.py policy remove RULE_ID
-kyoto.py policy preset compile-only                # Replace rules with defaults
+kyoto.py policy preset allow-all                   # Replace rules with defaults
 ```
 
 Rules are persistent and shared across projects. The **last matching rule wins**.
@@ -275,9 +277,11 @@ matches `profile=release`. Repeated values are all checked. `--scope cargo` is
 the default; `--scope args` examines arguments following Cargo's `--` separator.
 Cargo help/version requests are exempt from `require` rules.
 
-The initial preset allows commands but limits tests and benchmarks to compilation.
-Callers submit ordinary `cargo test` and `cargo bench` commands; Kyoto handles
-the Cargo compilation flag internally. Other policy denials still apply.
+The initial preset allows all commands, including test and benchmark execution.
+Existing queues retain their saved policy; use `policy preset allow-all` to reset
+an existing queue to the new default. The optional `policy preset compile-only`
+limits tests and benchmarks to compilation; Kyoto adds the Cargo compilation flag
+internally. Other policy denials still apply.
 JSON responses include `requested_command`, the effective `command`, and a
 `policy_message` explaining automatic compilation-only behavior. The message
 persists in `show`, `wait`, and history results, including after completion.

@@ -68,7 +68,7 @@ def initialize(db):
         scope TEXT NOT NULL, parameter TEXT, value TEXT, max_value INTEGER)''')
     if not db.execute('SELECT 1 FROM command_policy_meta WHERE id=1').fetchone():
         db.execute("INSERT INTO command_policy_meta VALUES (1,'allow')")
-        preset(db, 'compile-only')
+        preset(db, 'allow-all')
 
 
 def preset(db, name):

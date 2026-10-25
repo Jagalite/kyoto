@@ -365,6 +365,7 @@ kyoto.worker(Path(sys.argv[1]))
         self.assertEqual(self.wait(third)['status'], 'succeeded')
 
     def test_test_policy_adapts_execution_and_rejects_removed_override(self):
+        self.cli('policy', 'preset', 'compile-only')
         self.cli('config', '--pause')
         adjusted = json.loads(self.cli('submit', '--', 'cargo', 'test').stdout)
         self.assertEqual(adjusted['requested_command'], ['cargo', 'test'])
@@ -384,6 +385,7 @@ kyoto.worker(Path(sys.argv[1]))
         self.assertGreater(compiled['estimate'], checked['estimate'])
 
     def test_automatic_test_compilation_runs_effective_command_and_reports_logs(self):
+        self.cli('policy', 'preset', 'compile-only')
         cargo = Path(self.temp.name) / 'cargo'
         cargo.write_text("#!/bin/sh\nprintf '%s\\n' \"$@\"\n"
                          "for arg do\n  if [ \"$arg\" = --no-run ]; then exit 0; fi\ndone\n"

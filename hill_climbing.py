@@ -71,7 +71,7 @@ def _resources(snapshot):
     fraction = available / total
     cpu_cost = max(0, cpu - 80) / 100
     ram_cost = max(0, .2 - fraction) * 2
-    swap_cost = min(.3, sum(swaps) * 2)
+    swap_cost = min(.3, sum(value for value in swaps if _finite(value)) * 2)
     disk_cost = 0
     for metrics in disk['devices'].values() if disk_known(disk) else ():
         for direction in ('read', 'write'):
@@ -440,11 +440,14 @@ class HillClimbingController:
                             turnover_warmup_seconds=(now - self.turnover_started
                                                      if self.turnover_started is not None else 0),
                             per_job_rates=dict(self.per_job_rates), resource_factor=factor,
-                            telemetry_complete=bool(host_known(snapshot) and disk_known(snapshot.get('disk_io') or {})),
-                            partial_resource_observation=bool(known and not disk_known(snapshot.get('disk_io') or {})),
+                            telemetry_complete=bool(host_known(snapshot) and not snapshot.get('_kyoto_partial_swap')
+                                                    and disk_known(snapshot.get('disk_io') or {})),
+                            partial_resource_observation=bool(known and (snapshot.get('_kyoto_partial_swap')
+                                                    or not disk_known(snapshot.get('disk_io') or {}))),
                             probe_headroom=bool(headroom),
                             telemetry_state=('paused' if telemetry_blocked else 'partial'
-                                if known and not disk_known(snapshot.get('disk_io') or {}) else 'recovering'
+                                if known and (snapshot.get('_kyoto_partial_swap')
+                                    or not disk_known(snapshot.get('disk_io') or {})) else 'recovering'
                                 if self.telemetry_pause.recovering else 'measured' if known else 'unavailable'),
                             telemetry_grace_seconds=self.telemetry_pause.grace_seconds,
                             telemetry_pause_seconds=(now - self.telemetry_pause.since

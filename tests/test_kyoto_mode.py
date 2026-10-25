@@ -63,6 +63,37 @@ class KyotoModeTest(unittest.TestCase):
         self.assertEqual(h['hill_climb']['telemetry_state'], 'partial')
         self.assertEqual(p['max_running'], 2)
 
+    def test_windows_missing_swap_and_disk_can_probe_with_real_progress(self):
+        sample = host(disk=False, cap=12)
+        sample.update(swap_telemetry_supported=False,
+                      swap_in_mb_per_second=None, swap_out_mb_per_second=None)
+        for t, value in ((0, 0), (2, 10), (10, 50), (20, 150)):
+            policy, state = self.observe(t, [job('a', value)], host_sample=sample)
+        self.assertEqual(policy['max_running'], 2)
+        self.assertTrue(state['kyoto']['degraded_optimization'])
+        self.assertFalse(state['hill_climb']['telemetry_complete'])
+        self.assertIsNone(state['swap_in_mb_per_second'])
+
+    def test_unsupported_swap_with_measured_disk_still_reports_partial(self):
+        sample = host()
+        sample.update(swap_telemetry_supported=False,
+                      swap_in_mb_per_second=None, swap_out_mb_per_second=None)
+        for t, value in ((0, 0), (10, 50), (20, 150)):
+            _, state = self.observe(t, [job('a', value)], host_sample=sample)
+        self.assertEqual(state['hill_climb']['telemetry_state'], 'partial')
+        self.assertFalse(state['hill_climb']['telemetry_complete'])
+        self.assertTrue(state['kyoto']['degraded_optimization'])
+
+    def test_windows_opaque_work_can_ramp_but_missing_unmarked_swap_cannot(self):
+        for supported, expected in ((False, 3), (None, 1)):
+            self.controller = KyotoController()
+            sample = host(disk=False, cap=12)
+            sample.update(swap_telemetry_supported=supported,
+                          swap_in_mb_per_second=None, swap_out_mb_per_second=None)
+            for t in range(0, 40, 2):
+                policy, _ = self.observe(t, [job('a', measured=False)], host_sample=sample)
+            self.assertEqual(policy['max_running'], expected)
+
     def test_returning_disk_counters_restarts_partial_objective(self):
         for t, value in ((0, 0), (10, 50), (20, 150)):
             self.observe(t, [job('a', value)], host_sample=host(disk=False))

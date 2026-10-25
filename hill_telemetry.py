@@ -25,8 +25,10 @@ def host_known(snapshot):
     return (snapshot.get('valid') is True and finite(cpu) and 0 <= cpu <= 100
             and finite(available) and finite(total) and total > 0
             and 0 <= available <= total
-            and all(finite(snapshot.get('swap_' + direction + '_mb_per_second'))
-                    and snapshot['swap_' + direction + '_mb_per_second'] >= 0
+            and all((snapshot.get('_kyoto_partial_swap') is True
+                     and snapshot.get('swap_' + direction + '_mb_per_second') is None)
+                    or (finite(snapshot.get('swap_' + direction + '_mb_per_second'))
+                        and snapshot['swap_' + direction + '_mb_per_second'] >= 0)
                     for direction in ('in', 'out')))
 
 
