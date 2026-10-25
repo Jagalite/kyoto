@@ -5,6 +5,10 @@ import sys
 
 
 def sample_ticks():
+    if sys.platform == 'win32':
+        import psutil
+        times = psutil.cpu_times()
+        return [times.user, times.system, times.idle], [2]
     if sys.platform == 'darwin':
         lib = ctypes.CDLL('/usr/lib/libSystem.B.dylib')
         lib.mach_host_self.restype = ctypes.c_uint

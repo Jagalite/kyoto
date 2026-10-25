@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """Persistent local Rust command queue with FIFO or resource-aware scheduling."""
 import argparse
-import fcntl
+import os
+
+if os.name == 'nt':
+    from win32_runtime import fcntl
+else:
+    import fcntl
 import hashlib
 import json
 import math
-import os
 from pathlib import Path
 import signal
 import sqlite3
@@ -146,7 +150,11 @@ def public(row, root, runtime=None):
 
 def kill_group(pid, sig):
     try:
-        os.killpg(pid, sig)
+        if os.name == 'nt':
+            from win32_runtime import terminate_tree
+            terminate_tree(pid)
+        else:
+            os.killpg(pid, sig)
     except ProcessLookupError:
         pass
 
@@ -157,7 +165,7 @@ def finish(db, job_id, status, code=None, error=None, usage=None, finished_at=No
     if usage is not None:
         values.update(cpu_seconds=usage.ru_utime + usage.ru_stime,
                       user_cpu_seconds=usage.ru_utime, system_cpu_seconds=usage.ru_stime,
-                      wait_max_rss_mb=usage.ru_maxrss / (1048576 if sys.platform == 'darwin' else 1024),
+                      wait_max_rss_mb=(usage.ru_maxrss / (1048576 if sys.platform == 'darwin' else 1024) if usage.ru_maxrss is not None else None),
                       io_input_blocks=usage.ru_inblock, io_output_blocks=usage.ru_oublock)
     db.execute('UPDATE jobs SET ' + ', '.join(key + '=?' for key in values) + ' WHERE id=?',
                (*values.values(), job_id))
@@ -165,6 +173,9 @@ def finish(db, job_id, status, code=None, error=None, usage=None, finished_at=No
 
 
 def group_alive(pgid):
+    if os.name == 'nt':
+        from win32_runtime import identity
+        return identity(pgid) is not None
     try:
         result = subprocess.run(['ps', '-axo', 'pgid=,stat='], capture_output=True, text=True, timeout=2, check=True)
         return any(int(fields[0]) == pgid and not fields[1].startswith('Z')
@@ -326,7 +337,12 @@ def worker(root):
             db.execute("UPDATE jobs SET status='cancelled', finished=? WHERE status='queued' AND cancel=1", (now,))
             db.commit()
             if now - last_sample >= .5:
-                sampled = sample_groups([state['process'].pid for state in active.values() if state['process'].pid]) if active else {}
+                groups = [state['process'].pid for state in active.values() if state['process'].pid]
+                if os.name == 'nt':
+                    tokens = {state['process'].pid: state['process'].path.name for state in active.values()}
+                    sampled = sample_groups(groups, job_tokens=tokens) if active else {}
+                else:
+                    sampled = sample_groups(groups) if active else {}
                 rss_fresh = sampled is not None
                 if sampled is not None:
                     for job_id, state in active.items():
@@ -390,10 +406,12 @@ def worker(root):
                     # from a sampled cohort or a counter reaching 100 percent.
                     completed = db.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone()
                     controller.observe_result(dict(completed), time.monotonic())
+                    if isinstance(process, recovery.Attempt):
+                        process.release_terminal_lock()
                     del active[job_id]
                     continue
                 if state['cancelled'] or state.get('deferring'):
-                    signal_attempt(db, job_id, state, signal.SIGKILL if time.monotonic() >= state['deadline'] else signal.SIGTERM)
+                    signal_attempt(db, job_id, state, getattr(signal, 'SIGKILL', signal.SIGTERM) if time.monotonic() >= state['deadline'] else signal.SIGTERM)
             if host_sampled and not any(s.get('deferring') for s in active.values()):
                 running = [job_dict(r) for r in db.execute("SELECT * FROM jobs WHERE status='running'")]
                 eligible = {j['id'] for j in running if j['id'] in active and isinstance(active[j['id']]['process'], recovery.Attempt)
@@ -475,7 +493,8 @@ def ensure_worker(root):
             return False
     with open(root / 'worker.log', 'ab') as log:
         subprocess.Popen([sys.executable, str(Path(__file__).resolve()), '--state', str(root), '_worker'],
-                         stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+                         stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True,
+                         creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
     return True
 
 
@@ -488,7 +507,11 @@ def worker_ready(root, runtime):
     if not 0 <= time.time() - runtime.get('sampled_at', 0) < 10:
         return False
     try:
-        os.kill(coordinator['pid'], 0)
+        if os.name == 'nt':
+            if recovery.identity(coordinator['pid']) is None:
+                return False
+        else:
+            os.kill(coordinator['pid'], 0)
     except ProcessLookupError:
         return False
     return True
@@ -834,7 +857,10 @@ def main():
         db.close()
         if worker(root):
             # Reload modules from disk after releasing coordinator-only handles.
-            os.execv(sys.executable, [sys.executable, str(Path(__file__).resolve()), '--state', str(root), '_worker'])
+            if os.name == 'nt':
+                ensure_worker(root)
+            else:
+                os.execv(sys.executable, [sys.executable, str(Path(__file__).resolve()), '--state', str(root), '_worker'])
         return 0
     if args.action == 'policy':
         if args.policy_action != 'show':

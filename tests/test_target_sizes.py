@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 from kyoto import connect
 from target_sizes import TargetSizes
+from scheduling import path_key
 
 
 class TargetSizeTest(unittest.TestCase):
@@ -32,17 +33,17 @@ class TargetSizeTest(unittest.TestCase):
             def probe(command, **kwargs):
                 calls.append(command)
                 if command[0] == 'cargo':
-                    self.assertEqual(kwargs['env']['CARGO_TARGET_DIR'], str(target))
+                    self.assertEqual(kwargs['env']['CARGO_TARGET_DIR'], path_key(target, root))
                     return json.dumps(dict(workspace_root=str(root), target_directory=str(target)))
                 return real_output(command, **kwargs)
             try:
                 with patch.object(sizes, 'output', side_effect=probe):
                     first = sizes.measure('a')
                     second = sizes.measure('b')
-                self.assertEqual(first['path'], str(target))
+                self.assertEqual(first['path'], path_key(target, root))
                 self.assertGreaterEqual(first['mb'], 1)
                 self.assertEqual(first, second)
-                self.assertEqual(sum(command[0] == '/usr/bin/du' for command in calls), 1)
+                self.assertEqual(sum(command[0] == '/usr/bin/du' for command in calls), 0 if os.name == 'nt' else 1)
             finally:
                 sizes.close()
 

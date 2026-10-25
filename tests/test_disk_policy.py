@@ -1,4 +1,5 @@
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from disk_policy import disk_admissible
@@ -81,11 +82,11 @@ class DrivePressureTest(unittest.TestCase):
         seen = set()
         def mapped(path, sample, deadline=None):
             seen.add(str(path))
-            return {'devices': ['disk2' if str(path) == '/output' else 'disk1']}
+            return {'devices': ['disk2' if path == Path('/output') else 'disk1']}
         with patch('disk_io.discover_resources', return_value=(['/source', '/output'], 'ok')), \
              patch('disk_io.path_device', side_effect=mapped):
             self.assertEqual(scheduling_devices(task, {}), ['disk1', 'disk2'])
-        self.assertTrue({'/source', '/output', '/extra', '/home/.cargo', '/home/.rustup', '/scratch'} <= seen)
+        self.assertTrue({str(Path(p)) for p in ['/source', '/output', '/extra', '/home/.cargo', '/home/.rustup', '/scratch']} <= seen)
         with patch('disk_io.discover_resources', return_value=(['*'], 'unavailable')):
             self.assertIsNone(scheduling_devices(task, {}))
 

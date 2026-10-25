@@ -7,7 +7,8 @@ and provides a live terminal dashboard. Cargo manages its own build locks.
 Kyoto lets local agents coordinate their Rust builds and tests through a shared
 queue, reducing resource contention across projects and worktrees.
 
-Requires Python 3.9+ on macOS or Linux. No Python packages to install.
+Requires Python 3.9+ on macOS, Linux, or Windows. macOS and Linux need no
+additional Python packages; native Windows requires `psutil`.
 
 ![Kyoto dashboard showing running builds, planned jobs, history, and job details with fictional example data](docs/images/dashboard-preview.png)
 
@@ -19,6 +20,45 @@ cd kyoto
 ```
 
 Add the checkout directory to your shell's `PATH` to use Kyoto in future terminals.
+
+## Native Windows
+
+From PowerShell in the checkout:
+
+```powershell
+python -m pip install -r requirements-windows.txt
+python kyoto.py --help
+python kyoto.py submit -- cargo check --workspace
+python kyoto.py watch
+```
+
+Run `submit` from your Rust project directory, using the full path to `kyoto.py`
+when needed. Rust/Cargo must be installed separately. WSL is not required.
+The default queue remains at `~/.local/state/kyoto`; Windows and WSL queues
+must use separate state directories.
+
+Windows uses byte-range file locks and named Job Objects. Builds and descendants
+survive scheduler restarts, and cancellation terminates the whole job. Windows
+cancellation is immediate; Unix TERM handlers and the TERM/KILL grace period do
+not apply. If a runner is killed, its surviving commands remain tracked, but
+without a durable result their final status is `interrupted`.
+
+CPU and physical-memory measurements are available. Swap rates, disk telemetry,
+Unix block counts, and wait-time peak RSS are reported as unavailable. The Kyoto
+and hill-climb modes retain their conservative fallback when required telemetry
+is missing; choose `config --mode fifo --max-running N` for fixed concurrency.
+The terminal dashboard prints periodically when curses is unavailable. Installing
+`windows-curses` optionally enables the interactive dashboard. Windows target
+sizes measure file lengths rather than Unix allocated disk blocks.
+
+Run the native Windows lifecycle checks with:
+
+```powershell
+python -m unittest discover -s tests -p test_windows_runtime.py -v
+```
+
+The remaining integration suite includes Unix-specific signals, tools, and
+process probes; run it on Linux or macOS.
 
 ## Run
 

@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from kyoto import connect
-from scheduling import DEFAULT_CONFIG, choose_job, conflicts, discover_resources, forecast
+from scheduling import DEFAULT_CONFIG, choose_job, conflicts, discover_resources, forecast, path_key
 
 
 def job(id, submitted=0, estimate=10, cpu=1, memory=100, resources=None, **extra):
@@ -74,7 +74,7 @@ class PolicyTest(unittest.TestCase):
         meta = json.dumps(dict(workspace_root='/repo', target_directory='/shared', build_directory='/build'))
         with patch('scheduling.bounded_output', return_value=meta) as probe:
             paths, _ = discover_resources(['cargo', '+stable', 'build', '--target-dir', 'out', '--config', 'build.jobs=2'], '/repo', {}, [])
-            self.assertEqual(paths, ['/build', '/repo', '/repo/out', '/shared'])
+            self.assertEqual(paths, sorted(path_key(p, '/repo') for p in ['/build', '/repo', '/repo/out', '/shared']))
             self.assertIn('+stable', probe.call_args.args[0])
             self.assertIn('build.jobs=2', probe.call_args.args[0])
         with patch('scheduling.bounded_output', side_effect=ValueError()):
@@ -86,9 +86,14 @@ class PolicyTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             (root / 'real').mkdir()
-            (root / 'alias').symlink_to(root / 'real', target_is_directory=True)
+            try:
+                (root / 'alias').symlink_to(root / 'real', target_is_directory=True)
+            except OSError as exc:
+                if os.name == 'nt' and exc.winerror == 1314:
+                    self.skipTest('Windows symlink privilege unavailable')
+                raise
             paths, _ = discover_resources(['anything'], folder, {}, ['real', 'alias'])
-            self.assertEqual(paths, [str((root / 'real').resolve())])
+            self.assertEqual(paths, [path_key('real', root)])
 
     def test_legacy_schema_migration_preserves_job(self):
         with tempfile.TemporaryDirectory() as folder:

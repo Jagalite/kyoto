@@ -4,6 +4,12 @@ This is an argv policy for recognized Cargo invocations, not a sandbox for
 arbitrary scripts, Cargo aliases, build scripts, or custom test runners.
 """
 from pathlib import Path
+import os
+
+
+def executable_name(value):
+    name = Path(value).name
+    return name.lower().removesuffix(".exe") if os.name == "nt" else name
 
 # Starting heuristics: elapsed seconds, advisory CPU slots, memory MiB.
 PRIORS = {
@@ -21,13 +27,13 @@ def cargo_args(command):
     if not args:
         return None
     # Recognize common transparent launchers, without interpreting shell text.
-    if Path(args[0]).name == 'env':
+    if executable_name(args[0]) == 'env':
         args = args[1:]
         while args and ('=' in args[0] and not args[0].startswith('-')):
             args = args[1:]
-    if len(args) >= 4 and Path(args[0]).name == 'rustup' and args[1] == 'run':
+    if len(args) >= 4 and executable_name(args[0]) == 'rustup' and args[1] == 'run':
         args = args[3:]
-    if not args or Path(args[0]).name != 'cargo':
+    if not args or executable_name(args[0]) != 'cargo':
         return None
     args = args[1:]
     if args and args[0].startswith('+'):

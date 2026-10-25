@@ -3,9 +3,13 @@ import json
 import math
 import os
 from pathlib import Path
-import signal
 import subprocess
+
 import sys
+
+from process_control import spawn_probe, kill_probe, close_probe
+
+from commands import executable_name
 
 DEFAULT_CONFIG = {
     'mode': 'kyoto', 'max_running': 'auto', 'cpu_budget': os.cpu_count() or 1,
@@ -16,7 +20,8 @@ DEFAULT_CONFIG = {
 
 def path_key(value, cwd):
     path = Path(value)
-    return str((Path(cwd) / path).resolve())
+    resolved = str((Path(cwd) / path).resolve())
+    return os.path.normcase(resolved).replace('\\', '/') if os.name == 'nt' else resolved
 
 
 def conflicts(left, right):
@@ -111,20 +116,23 @@ def execution_plan(queued, running, config, now):
 
 
 def bounded_output(command, cwd=None, env=None, timeout=5):
-    process = subprocess.Popen(command, cwd=cwd, env=env, stdout=subprocess.PIPE,
-                               stderr=subprocess.DEVNULL, start_new_session=True)
+    process = spawn_probe(command, cwd=cwd, env=env, stdout=subprocess.PIPE,
+                          stderr=subprocess.DEVNULL)
     try:
-        data, _ = process.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
         try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        process.communicate()
-        raise
-    if process.returncode:
-        raise ValueError('probe failed')
-    return data.decode()
+            data, _ = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                kill_probe(process)
+            except ProcessLookupError:
+                pass
+            process.communicate()
+            raise
+        if process.returncode:
+            raise ValueError('probe failed')
+        return data.decode()
+    finally:
+        close_probe(process)
 
 
 def discover_resources(command, cwd, env, explicit, *, details=None, probe=None):
@@ -136,7 +144,7 @@ def discover_resources(command, cwd, env, explicit, *, details=None, probe=None)
     probe = probe or bounded_output
     if explicit:
         return sorted(set(path_key(p, cwd) for p in explicit)), 'explicit resource paths'
-    if Path(command[0]).name != 'cargo':
+    if executable_name(command[0]) != 'cargo':
         return ['*'], 'opaque command; globally exclusive (use --resource for known paths)'
     args = command[1:]
     prefix = [command[0]]
@@ -185,6 +193,9 @@ def discover_resources(command, cwd, env, explicit, *, details=None, probe=None)
 
 
 def host_available_mb():
+    if os.name == 'nt':
+        from win32_runtime import memory
+        return memory()['available_mb']
     try:
         if sys.platform == 'darwin':
             output = bounded_output(['/usr/bin/vm_stat'], timeout=2)
@@ -204,9 +215,34 @@ def host_available_mb():
     return None
 
 
-def sample_groups(groups):
+def sample_groups(groups, *, job_tokens=None):
     """Sample aggregate RSS of each process group, in MiB (shared pages may repeat)."""
     result = {group: 0.0 for group in groups}
+    if os.name == 'nt':
+        import psutil
+        from win32_runtime import Job
+        try:
+            for group in groups:
+                if job_tokens and group in job_tokens:
+                    job = Job(job_tokens[group])
+                    try:
+                        pids = job.pids()
+                    finally:
+                        job.close()
+                else:
+                    try:
+                        process = psutil.Process(group)
+                        pids = [group] + [p.pid for p in process.children(recursive=True)]
+                    except psutil.NoSuchProcess:
+                        continue
+                for pid in pids:
+                    try:
+                        result[group] += psutil.Process(pid).memory_info().rss / 1048576
+                    except psutil.NoSuchProcess:
+                        pass
+            return result
+        except (psutil.AccessDenied, OSError):
+            return None
     try:
         output = bounded_output(['ps', '-axo', 'pgid=,rss='], timeout=2)
         for line in output.splitlines():

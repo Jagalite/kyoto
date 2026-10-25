@@ -1,5 +1,8 @@
 """Terminal observer with automatic worker recovery."""
-import curses
+try:
+    import curses
+except ImportError:
+    curses = None
 import datetime
 import json
 import os
@@ -551,6 +554,17 @@ def screen_loop(screen, root, interval, history, sizes):
 
 
 def watch(root, interval=1, history=None, once=False):
+    if curses is None and not once:
+        try:
+            while True:
+                result = watch(root, interval, history, once=True)
+                if result:
+                    return result
+                if not (sys.stdin.isatty() and sys.stdout.isatty()):
+                    return 0
+                time.sleep(interval)
+        except KeyboardInterrupt:
+            return 0
     if once or not (sys.stdin.isatty() and sys.stdout.isatty()):
         try:
             from kyoto import recover_existing

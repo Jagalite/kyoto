@@ -56,10 +56,13 @@ def sample_host():
         pass
     try:
         result['load_average_1m'] = os.getloadavg()[0]
-    except OSError:
+    except (OSError, AttributeError):
         result['load_average_1m'] = None
     try:
-        if sys.platform == 'darwin':
+        if sys.platform == 'win32':
+            from win32_runtime import memory
+            result.update(memory())
+        elif sys.platform == 'darwin':
             result.update(parse_vm_stat(bounded_output(['/usr/bin/vm_stat'], timeout=2)))
             result['total_mb'] = int(bounded_output(['/usr/sbin/sysctl', '-n', 'hw.memsize'], timeout=2)) / 1048576
             # The OS pressure key is optional on some macOS versions.
@@ -129,7 +132,10 @@ class AdaptiveController:
             elapsed = host['sample_monotonic'] - self.previous['sample_monotonic']
             if elapsed > 0:
                 for direction in ('in', 'out'):
-                    difference = host['swap_' + direction + '_mb'] - self.previous['swap_' + direction + '_mb']
+                    key = 'swap_' + direction + '_mb'
+                    if host.get(key) is None or self.previous.get(key) is None:
+                        continue
+                    difference = host[key] - self.previous[key]
                     if difference >= 0:
                         snapshot['swap_' + direction + '_mb_per_second'] = difference / elapsed
         snapshot['cpu_percent'] = utilization(
