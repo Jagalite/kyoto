@@ -315,6 +315,7 @@ def worker(root):
         recovery_ready = False
         while True:
             now = time.time()
+            mono_now = time.monotonic()
             # Handoff only between iterations, with no launch transaction open.
             # Durable runners retain ownership of commands and their results.
             request = db.execute('SELECT 1 FROM worker_restart WHERE session=? AND expires>=?', (worker_session, now)).fetchone()
@@ -330,13 +331,13 @@ def worker(root):
                       file=sys.stderr, flush=True)
                 return True
             host_sampled = False
-            if legacy_lock is None and now - last_legacy_check >= 2:
+            if legacy_lock is None and mono_now - last_legacy_check >= 2:
                 legacy_lock = recovery.claim_legacy_lock(root)
-                last_legacy_check = now
+                last_legacy_check = mono_now
             config = config_for(db)
             db.execute("UPDATE jobs SET status='cancelled', finished=? WHERE status='queued' AND cancel=1", (now,))
             db.commit()
-            if now - last_sample >= .5:
+            if mono_now - last_sample >= .5:
                 groups = [state['process'].pid for state in active.values() if state['process'].pid]
                 if os.name == 'nt':
                     tokens = {state['process'].pid: state['process'].path.name for state in active.values()}
@@ -350,8 +351,8 @@ def worker(root):
                         db.execute('UPDATE jobs SET current_rss_mb=?, peak_rss_mb=MAX(COALESCE(peak_rss_mb,0),?), rss_samples=rss_samples+1 WHERE id=?',
                                    (rss, rss, job_id))
                     db.commit()
-                last_sample = now
-            if now - last_host_sample >= SAMPLE_SECONDS or config != last_config:
+                last_sample = mono_now
+            if mono_now - last_host_sample >= SAMPLE_SECONDS or config != last_config:
                 queued = [job_dict(r) for r in db.execute("SELECT * FROM jobs WHERE status='queued' AND cancel=0")]
                 running = [job_dict(r) for r in db.execute("SELECT * FROM jobs WHERE status='running'")]
                 progress_tracker.prune([j['id'] for j in running] if config['mode'] in ('hill-climb', 'kyoto') else [])
@@ -380,7 +381,7 @@ def worker(root):
                            (json.dumps(pressure_snapshot),))
                 db.commit()
                 available_mb = host.get('available_mb')
-                last_host_sample = now
+                last_host_sample = mono_now
                 last_config = config
                 host_sampled = True
             for job_id, state in list(active.items()):
@@ -415,7 +416,7 @@ def worker(root):
             if host_sampled and not any(s.get('deferring') for s in active.values()):
                 running = [job_dict(r) for r in db.execute("SELECT * FROM jobs WHERE status='running'")]
                 eligible = {j['id'] for j in running if j['id'] in active and isinstance(active[j['id']]['process'], recovery.Attempt)
-                            and active[j['id']]['process'].pid and rss_fresh and time.time() - last_sample < 3}
+                            and active[j['id']]['process'].pid and rss_fresh and time.monotonic() - last_sample < 3}
                 candidate = deferrer.choose(config, pressure_snapshot, running, time.monotonic(), now,
                     eligible_ids=eligible)
                 reason = 'sustained memory/swap/disk pressure' if pressure_snapshot.get('disk_pressure') else 'sustained memory/swap pressure'
@@ -498,13 +499,17 @@ def ensure_worker(root):
     return True
 
 
+def sample_fresh(runtime):
+    return bool(runtime and 0 <= time.monotonic() - runtime.get('sample_monotonic', float('-inf')) < 10)
+
+
 def worker_ready(root, runtime):
     coordinator = recovery.read_json(root / 'coordinator.json')
     if not coordinator or not runtime.get('recovery_ready'):
         return False
     if runtime.get('worker_session') != coordinator.get('session') or runtime.get('worker_pid') != coordinator.get('pid'):
         return False
-    if not 0 <= time.time() - runtime.get('sampled_at', 0) < 10:
+    if not sample_fresh(runtime):
         return False
     try:
         if os.name == 'nt':
@@ -604,7 +609,7 @@ def plan_submission(db, values):
     config = config_for(db)
     runtime = runtime_for(db)
     now = time.time()
-    fresh = bool(runtime and now - runtime['sampled_at'] < 10 and dict(DEFAULT_CONFIG, **runtime.get('config', {})) == config)
+    fresh = bool(sample_fresh(runtime) and dict(DEFAULT_CONFIG, **runtime.get('config', {})) == config)
     limit = runtime['effective_max_running'] if fresh else 0
     planning_limit = limit or (config['max_running'] if config['max_running'] != 'auto' else 1)
     rows = [job_dict(r) for r in db.execute("SELECT * FROM jobs WHERE status IN ('queued','running')")]
@@ -653,7 +658,7 @@ def status(db, root):
     running = [job_dict(r) for r in rows if r['status'] == 'running']
     now = time.time()
     runtime = runtime_for(db)
-    fresh = runtime and now - runtime['sampled_at'] < 10 and dict(DEFAULT_CONFIG, **runtime.get('config', {})) == config
+    fresh = sample_fresh(runtime) and dict(DEFAULT_CONFIG, **runtime.get('config', {})) == config
     policy = dict(config, max_running=runtime['effective_max_running'] if fresh else 0,
                   min_available_memory_mb=runtime['effective_memory_reserve_mb'] if fresh else 0)
     if fresh:
@@ -794,6 +799,8 @@ def main():
     configure.add_argument('--active-drain', choices=['on', 'off'],
         help='Cost-gated rollback of a rejected Kyoto probe; requires auto-defer and pressure-aware (default off)')
     configure.add_argument('--auto-defer', choices=['on', 'off'], help='Stop and requeue eligible builds for sustained pressure or short-job priority (default on)')
+    configure.add_argument('--commit-pause-mb', type=nonnegative_float)
+    configure.add_argument('--commit-resume-mb', type=nonnegative_float)
     configure.add_argument('--cpu-budget', type=positive_int)
     configure.add_argument('--memory-budget-mb', type=nonnegative_float, help='Deprecated compatibility option; no admission effect')
     configure.add_argument('--aging-seconds', type=positive_float)
@@ -906,6 +913,9 @@ def main():
                 updates[key] = updates[key] == 'on'
         if args.pause or args.resume:
             updates['paused'] = args.pause
+        merged = dict(config_for(db), **updates)
+        if merged['commit_pause_mb'] >= merged['commit_resume_mb']:
+            parser.error('commit pause threshold must be below resume threshold')
         for key, value in updates.items():
             db.execute('INSERT INTO settings (key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', (key, json.dumps(value)))
         db.commit()
@@ -915,7 +925,7 @@ def main():
     elif args.action == 'health':
         runtime = runtime_for(db)
         print(json.dumps({'config': config_for(db), 'runtime': runtime,
-                          'sample_fresh': bool(runtime and runtime.get('recovery_ready', True) and time.time() - runtime['sampled_at'] < 10)}))
+                          'sample_fresh': bool(sample_fresh(runtime) and runtime.get('recovery_ready', True))}))
     elif args.action == 'submit':
         submit_job(db, root, args, parser)
     elif args.action in ('start', 'status'):
@@ -934,8 +944,14 @@ def main():
         print(json.dumps([public(r, root) for r in db.execute("SELECT * FROM jobs WHERE status NOT IN ('queued','running') ORDER BY finished DESC LIMIT ?", (args.limit,))]))
     else:
         row = db.execute('SELECT * FROM jobs WHERE id=?', (args.id,)).fetchone()
+        if row is None and args.action in ('show', 'logs', 'wait', 'cancel'):
+            matches = db.execute('SELECT * FROM jobs WHERE substr(id,1,?)=? LIMIT 2', (len(args.id), args.id)).fetchall()
+            if len(matches) > 1:
+                parser.error('ambiguous job id prefix')
+            row = matches[0] if matches else None
         if row is None:
             parser.error('unknown job id')
+        args.id = row['id']
         if args.action == 'cancel':
             actor = identity(args.user_id, parser)
             if not cancel_job(db, args.id, actor, args.force):

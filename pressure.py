@@ -30,7 +30,7 @@ def parse_vm_stat(output):
                 swap_out_mb=counters['Swapouts'] * page_bytes / 1048576)
 
 
-def parse_linux(meminfo, vmstat, page_bytes, psi=None):
+def parse_linux(meminfo, vmstat, page_bytes, psi=None, overcommit=None):
     memory = {line.split(':')[0]: int(line.split()[1]) for line in meminfo.splitlines()}
     counters = dict(line.split() for line in vmstat.splitlines())
     result = dict(available_mb=memory['MemAvailable'] / 1024, total_mb=memory['MemTotal'] / 1024,
@@ -38,6 +38,10 @@ def parse_linux(meminfo, vmstat, page_bytes, psi=None):
                   swap_in_mb=int(counters['pswpin']) * page_bytes / 1048576,
                   swap_out_mb=int(counters['pswpout']) * page_bytes / 1048576,
                   pressure='unknown')
+    if overcommit is not None and int(overcommit.strip()) == 2:
+        result.update(commit_limit_mb=memory['CommitLimit'] / 1024,
+                      commit_used_mb=memory['Committed_AS'] / 1024,
+                      commit_headroom_mb=(memory['CommitLimit'] - memory['Committed_AS']) / 1024)
     if psi:
         averages = {line.split()[0]: float(dict(field.split('=') for field in line.split()[1:])['avg10'])
                     for line in psi.splitlines()}
@@ -82,7 +86,8 @@ def sample_host():
                 psi = Path('/proc/pressure/memory').read_text()
             except OSError:
                 psi = None
-            result.update(parse_linux(Path('/proc/meminfo').read_text(), Path('/proc/vmstat').read_text(), os.sysconf('SC_PAGE_SIZE'), psi))
+            overcommit = Path('/proc/sys/vm/overcommit_memory').read_text()
+            result.update(parse_linux(Path('/proc/meminfo').read_text(), Path('/proc/vmstat').read_text(), os.sysconf('SC_PAGE_SIZE'), psi, overcommit))
         result['valid'] = True
     except (OSError, ValueError, KeyError, IndexError, subprocess.TimeoutExpired) as exc:
         result.update(valid=False, error=str(exc), available_mb=None)
@@ -97,6 +102,7 @@ class AdaptiveController:
         self.hill_climber = HillClimbingController()
         self.kyoto_controller = KyotoController()
         self.mode = None
+        self.commit_blocked = False
 
     def observe_result(self, job, now):
         """Consume a terminal result once, after the executor has persisted it."""
@@ -146,8 +152,19 @@ class AdaptiveController:
         reason = 'configured concurrency'
         blocked = False
         if aware:
+            headroom = host.get('commit_headroom_mb')
+            if headroom is not None:
+                if headroom < config.get('commit_pause_mb', 3072):
+                    self.commit_blocked = True
+                elif headroom > config.get('commit_resume_mb', 4608):
+                    self.commit_blocked = False
+            else:
+                self.commit_blocked = False
+            snapshot['commit_blocked'] = self.commit_blocked
             if not valid:
                 reason, blocked = 'host pressure measurement unavailable', True
+            elif self.commit_blocked:
+                reason, blocked = 'low commit headroom', True
             elif host.get('pressure') in ('warning', 'critical'):
                 reason, blocked = 'OS memory pressure: ' + host['pressure'], True
             elif (snapshot['swap_out_mb_per_second'] or 0) >= SWAP_RATE_MB or (snapshot['swap_in_mb_per_second'] or 0) >= SWAP_RATE_MB:

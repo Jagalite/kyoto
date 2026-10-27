@@ -84,7 +84,7 @@ def read_snapshot(root, history=None):
             job['progress'] = job_progress(root, job, snapshot['now'], observed=observed) if job['status'] == 'running' else {}
         runtime = snapshot['runtime']
         config = snapshot['config']
-        fresh = bool(runtime and runtime.get('recovery_ready', True) and snapshot['now'] - runtime['sampled_at'] < 10 and dict(DEFAULT_CONFIG, **runtime.get('config', {})) == config)
+        fresh = bool(runtime and runtime.get('recovery_ready', True) and 0 <= time.monotonic() - runtime.get('sample_monotonic', float('-inf')) < 10 and dict(DEFAULT_CONFIG, **runtime.get('config', {})) == config)
         snapshot['fresh'] = fresh
         if config['paused']:
             snapshot['reason'] = 'Queue paused; running commands continue'
@@ -318,7 +318,7 @@ def draw_dashboard(screen, snapshot, root, selected, logs, styles, error=None, v
     host = snapshot['runtime'] or {}
     jobs = snapshot['jobs']
     # Animate on redraws without increasing database or host sampling frequency.
-    live = snapshot['fresh'] and not error and 0 <= time.time() - host.get('sampled_at', 0) < 10
+    live = snapshot['fresh'] and not error and 0 <= time.monotonic() - host.get('sample_monotonic', float('-inf')) < 10
     spinner = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'[int(time.monotonic() * 4) % 10] if live else '·'
     running = sum(j['status'] == 'running' for j in jobs)
     queued = sum(j['status'] == 'queued' for j in jobs)

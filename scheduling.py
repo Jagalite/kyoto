@@ -14,6 +14,7 @@ from commands import executable_name
 DEFAULT_CONFIG = {
     'mode': 'kyoto', 'max_running': 'auto', 'cpu_budget': os.cpu_count() or 1,
     'memory_budget_mb': 0, 'aging_seconds': 300,
+    'commit_pause_mb': 3072, 'commit_resume_mb': 4608,
     'min_available_memory_mb': 0, 'pressure_aware': True, 'auto_defer': True, 'active_drain': False,
 }
 

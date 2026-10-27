@@ -125,10 +125,26 @@ def identity(pid):
         raise PermissionError(str(exc)) from exc
 
 
+class PerformanceInformation(ctypes.Structure):
+    _fields_ = [('cb', W.DWORD)] + [(name, ctypes.c_size_t) for name in (
+        'CommitTotal', 'CommitLimit', 'CommitPeak', 'PhysicalTotal', 'PhysicalAvailable',
+        'SystemCache', 'KernelTotal', 'KernelPaged', 'KernelNonpaged', 'PageSize')] + [
+        ('HandleCount', W.DWORD), ('ProcessCount', W.DWORD), ('ThreadCount', W.DWORD)]
+
+
 def memory():
+    info = PerformanceInformation()
+    info.cb = ctypes.sizeof(info)
+    function = ctypes.WinDLL('psapi', use_last_error=True).GetPerformanceInfo
+    function.argtypes = [ctypes.POINTER(PerformanceInformation), W.DWORD]
+    function.restype = W.BOOL
+    check(function(ctypes.byref(info), info.cb))
     value = psutil.virtual_memory()
     # Windows does not expose Unix swap-in/out counters through psutil.
-    return dict(available_mb=value.available / 1048576, total_mb=value.total / 1048576,
+    return dict(commit_headroom_mb=(info.CommitLimit - info.CommitTotal) * info.PageSize / 1048576,
+                commit_limit_mb=info.CommitLimit * info.PageSize / 1048576,
+                commit_used_mb=info.CommitTotal * info.PageSize / 1048576,
+                available_mb=value.available / 1048576, total_mb=value.total / 1048576,
                 swap_used_mb=None, swap_telemetry_supported=False, pressure='normal' if value.percent < 90 else 'warning')
 
 

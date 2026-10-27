@@ -53,6 +53,16 @@ class QueueTest(unittest.TestCase):
         self.assertLess(c['estimate'], 5)
         self.assertNotIn('environment', c)
 
+    def test_job_id_prefix_commands(self):
+        job_id = self.submit("print('prefix log')")
+        self.assertEqual(self.wait(job_id[:8])['id'], job_id)
+        self.assertEqual(json.loads(self.cli('show', job_id[:8]).stdout)['id'], job_id)
+        self.assertIn('prefix log', self.cli('logs', job_id[:8]).stdout)
+        self.cli('config', '--pause')
+        queued = self.submit("print('cancelled')")
+        self.cli('cancel', queued[:8])
+        self.assertNotEqual(self.cli('show', '', check=False).returncode, 0)
+
     def test_cancel_queued_and_running_and_failure(self):
         running = self.submit('import time; time.sleep(10)')
         queued = self.submit("raise RuntimeError('should not run')")
