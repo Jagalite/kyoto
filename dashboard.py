@@ -341,7 +341,7 @@ def draw_dashboard(screen, snapshot, root, selected, logs, styles, error=None, v
     put(4, 2, memory_summary(host), 'warn' if snapshot['fresh'] and host.get('pressure') in ('warning', 'critical') else 'info')
     sampled = host.get('sampled_at')
     if sampled is not None:
-        age = max(0, time.time() - sampled)
+        age = max(0, time.monotonic() - host.get('sample_monotonic', time.monotonic()))
         stamp = datetime.datetime.fromtimestamp(sampled).strftime('%H:%M:%S')
         put(2, 2, f'Sample {stamp} · {age:.0f}s ago' + (' · STALE' if not snapshot['fresh'] else ''),
             'muted' if snapshot['fresh'] else 'warn')

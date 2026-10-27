@@ -12,6 +12,9 @@ class FixesTest(unittest.TestCase):
             return controller.update(config, dict(valid=True, sample_monotonic=0, pressure='normal', commit_headroom_mb=value), [], [], 0)[0]['max_running']
         self.assertEqual(sample(3072), 2)
         self.assertEqual(sample(3071), 0)
+        failed = dict(valid=False, sample_monotonic=0)
+        self.assertEqual(controller.update(config, failed, [], [], 0)[0]['max_running'], 0)
+        self.assertEqual(sample(4000), 0)
         self.assertEqual(sample(4608), 0)
         self.assertEqual(sample(4609), 2)
 

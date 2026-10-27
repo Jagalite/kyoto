@@ -158,7 +158,7 @@ class AdaptiveController:
                     self.commit_blocked = True
                 elif headroom > config.get('commit_resume_mb', 4608):
                     self.commit_blocked = False
-            else:
+            elif valid:
                 self.commit_blocked = False
             snapshot['commit_blocked'] = self.commit_blocked
             if not valid:
